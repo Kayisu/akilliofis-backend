@@ -7,12 +7,6 @@ from config import PB_BASE_URL, PB_ADMIN_EMAIL, PB_ADMIN_PASSWORD
 from pb_client import PBClient
 
 def run_forecast_cycle():
-    """
-    Bu fonksiyon çağrıldığında:
-    1. Geçmiş veriyi çeker.
-    2. Modeli eğitir.
-    3. Gelecek 24 saatin tahminini PocketBase'e yazar.
-    """
     print("\n--- [Forecaster] Tahmin döngüsü tetiklendi ---")
     client = PBClient(base_url=PB_BASE_URL)
     

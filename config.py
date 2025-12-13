@@ -4,8 +4,12 @@ PB_ADMIN_PASSWORD = "12345678"
 
 PLACE_ID = "jat8nmi4h0bsii0"
 
-SENSOR_INTERVAL_SECONDS = 5
-FORECAST_INTERVAL_SECONDS = 86400  # 24 saatte bir tahmin üret
 
-# Kutu içi sıcaklık artışını dengelemek için katsayı (CPU Comp Factor)
-TEMP_CORRECTION_FACTOR = 3.0
+STARTUP_DELAY_SECONDS = 30 
+
+SENSOR_INTERVAL_SECONDS = 5
+
+FORECAST_INTERVAL_SECONDS = 900
+
+# Sıcaklık Düzeltme Katsayısı 
+TEMP_CORRECTION_FACTOR = 1.5

@@ -12,7 +12,7 @@ from adafruit_scd4x import SCD4X
 from config import (
     PB_ADMIN_EMAIL, PB_ADMIN_PASSWORD, PB_BASE_URL,
     SENSOR_INTERVAL_SECONDS, FORECAST_INTERVAL_SECONDS,
-    TEMP_CORRECTION_FACTOR
+    TEMP_CORRECTION_FACTOR, STARTUP_DELAY_SECONDS 
 )
 from comfort import calc_comfort_score
 from pb_client import PBClient
@@ -69,12 +69,12 @@ def run_forecast_logic(client: PBClient):
         )
 
 def main():
-    client = PBClient(base_url=PB_BASE_URL)
-    client.login_with_password(PB_ADMIN_EMAIL, PB_ADMIN_PASSWORD)
+    # --- YENİ KISIM: AÇILIŞ BEKLEMESİ ---
+    print(f">>> Sistem başlatıldı. Sensör stabilizasyonu için {STARTUP_DELAY_SECONDS} sn bekleniyor...")
+    time.sleep(STARTUP_DELAY_SECONDS)
+    print(">>> Bekleme tamamlandı. Bağlantılar kuruluyor...")
 
-    bme, scd4x, pir = setup_sensors()
-    last_forecast = 0
-    print(f"Sistem devrede. Aralık: {SENSOR_INTERVAL_SECONDS}sn. LED: YOK.")
+    client = PBClient(base_url=PB_BASE_URL)
 
     while True:
         start_time = time.time()
