@@ -1,5 +1,3 @@
-# sensor_agent.py
-
 import time
 import datetime
 import random
@@ -9,16 +7,24 @@ from gpiozero import MotionSensor
 from adafruit_bme680 import Adafruit_BME680_I2C
 from adafruit_scd4x import SCD4X
 
+# DÜZELTME 1: PLACE_ID buraya eklendi
 from config import (
     PB_ADMIN_EMAIL, PB_ADMIN_PASSWORD, PB_BASE_URL,
     SENSOR_INTERVAL_SECONDS, FORECAST_INTERVAL_SECONDS,
-    TEMP_CORRECTION_FACTOR, STARTUP_DELAY_SECONDS 
+    TEMP_CORRECTION_FACTOR, STARTUP_DELAY_SECONDS,
+    PLACE_ID 
 )
 from comfort import calc_comfort_score
 from pb_client import PBClient
 
 def setup_sensors():
-    i2c = busio.I2C(board.SCL, board.SDA)
+    # I2C hatası alırsan burayı try-except içine almak gerekebilir
+    try:
+        i2c = busio.I2C(board.SCL, board.SDA)
+    except Exception as e:
+        print(f"[Kritik] I2C başlatılamadı: {e}")
+        return None, None, None
+
     bme, scd4x = None, None
 
     try:
@@ -33,6 +39,7 @@ def setup_sensors():
     except:
         print("[Uyarı] SCD41 bulunamadı.")
 
+    # PIR sensörü bazen başlangıçta yanlış tetiklenebilir
     pir = MotionSensor(17)
     return bme, scd4x, pir
 
@@ -46,11 +53,13 @@ def get_cpu_temperature() -> float:
 def run_forecast_logic(client: PBClient):
     """Admin paneli grafikleri için basit tahmin verisi üretir."""
     print(">>> Tahmin verileri oluşturuluyor...")
+    # Not: client.get_recent_readings metodunun pb_client.py içinde tanımlı olduğundan emin ol
     items = client.get_recent_readings(limit=20)
     if not items: return
 
     total_comfort, occupied_count = 0.0, 0
     for it in items:
+        # items bir dict listesi döner
         total_comfort += float(it.get("comfort_score") or 0.5)
         if it.get("pir_occupied"): occupied_count += 1
     
@@ -62,6 +71,7 @@ def run_forecast_logic(client: PBClient):
     for i in range(1, 7):
         future_ts = now + datetime.timedelta(minutes=30 * i)
         variation = random.uniform(-0.05, 0.05)
+        # create_forecast metodunun pb_client.py içinde tanımlı olduğundan emin ol
         client.create_forecast(
             future_ts, 
             max(0.0, min(1.0, avg_occ + variation)),
@@ -69,17 +79,20 @@ def run_forecast_logic(client: PBClient):
         )
 
 def main():
-    # --- YENİ KISIM: AÇILIŞ BEKLEMESİ ---
     print(f">>> Sistem başlatıldı. Sensör stabilizasyonu için {STARTUP_DELAY_SECONDS} sn bekleniyor...")
     time.sleep(STARTUP_DELAY_SECONDS)
     
-    # DÜZELTME 1: Sensörleri burada başlatıp değişkenlere atıyoruz
     print(">>> Bekleme tamamlandı. Sensörler ve bağlantılar kuruluyor...")
+    # DÜZELTME 2: Sensörleri main içinde başlatıp değişkenlere alıyoruz
     bme, scd4x, pir = setup_sensors()
+
+    if not pir: # I2C hatası olduysa çık
+        print("Sensör kurulum hatası. Çıkılıyor.")
+        return
 
     client = PBClient(base_url=PB_BASE_URL)
 
-    # DÜZELTME 2: Döngüden önce zamanlayıcıyı başlatmazsak hata verir
+    # DÜZELTME 3: Zamanlayıcıyı döngüden önce başlatıyoruz
     last_forecast = time.time()
 
     while True:
@@ -90,7 +103,6 @@ def main():
         co2, raw_temp, hum, voc = None, None, None, 0.0
         
         # SCD41 Okuma
-        # scd4x değişkeni artık yukarıda tanımlandığı için bu blok çalışır
         if scd4x and scd4x.data_ready:
             try:
                 co2 = float(scd4x.CO2)
@@ -98,7 +110,7 @@ def main():
                 hum = float(scd4x.relative_humidity)
             except: pass
 
-        # BME680 Okuma (Yedek veya VOC için)
+        # BME680 Okuma
         if bme:
             try:
                 if raw_temp is None: raw_temp = float(bme.temperature)
@@ -107,8 +119,7 @@ def main():
             except: pass
 
         if raw_temp is None:
-            # Eğer hiç sıcaklık okunamazsa (sensör hatası) bekle ve tekrar dene
-            print("[Uyarı] Sensör verisi okunamadı, tekrar deneniyor...")
+            print("[Uyarı] Sıcaklık okunamadı, bekleniyor...")
             time.sleep(SENSOR_INTERVAL_SECONDS)
             continue
 
@@ -121,15 +132,13 @@ def main():
         # --- 3. Veri Hazırlama ---
         is_occupied = pir.motion_detected
         c_score = 0.5
-        # co2 değeri varsa hesapla, yoksa varsayılan kalır veya BME ile hesaplanabilir
-        if co2 or raw_temp: 
-             # Not: calc_comfort_score parametrelerini kontrol edin, co2 None ise hata verebilir.
-             # Basit bir check:
-             safe_co2 = co2 if co2 else 400
-             c_score = calc_comfort_score(comp_temp, hum, safe_co2, voc)
+        
+        safe_co2 = co2 if co2 else 400
+        # Konfor skoru hesaplama
+        c_score = calc_comfort_score(comp_temp, hum, safe_co2, voc)
 
         payload = {
-            "place_id": config.PLACE_ID, # Config dosyasındaki ID'yi eklemeyi unutmayın
+            "place_id": PLACE_ID, # DÜZELTME 4: config.PLACE_ID yerine direkt PLACE_ID
             "recorded_at": loop_ts.strftime("%Y-%m-%d %H:%M:%SZ"),
             "pir_occupied": is_occupied,
             "temp_c": round(comp_temp, 2),
@@ -158,7 +167,6 @@ def main():
             print(f"[Hata] Veri gönderilemedi: {e}")
 
         # --- 4. Tahmin Kontrolü ---
-        # last_forecast artık tanımlı olduğu için burası hata vermez
         if time.time() - last_forecast > FORECAST_INTERVAL_SECONDS:
             try:
                 run_forecast_logic(client)
