@@ -125,7 +125,20 @@ def main():
             "comfort_score": c_score,
         }
 
-        print(f"[{loop_ts.strftime('%H:%M:%S')}] Sıcaklık: {comp_temp:.2f}°C (CPU: {cpu_temp:.1f}) | Hareket: {is_occupied} | Konfor: {c_score}")
+        # --- GÃœNCELLENEN LOG SATIRI ---
+        # TÃ¼m verileri tek satÃ½rda ama okunabilir gÃ¶relim:
+        log_msg = (
+            f"[{loop_ts.strftime('%H:%M:%S')}] "
+            f"CPU:{cpu_temp:.1f}Â°C | "
+            f"Ham:{raw_temp:.1f}Â°C -> "
+            f"Net:{comp_temp:.2f}Â°C | "
+            f"Nem:%{hum:.1f} | "
+            f"VOC:{voc:.1f} | "
+            f"CO2:{co2 if co2 else '---'} ppm | "
+            f"Hareket:{'VAR' if is_occupied else 'yok'}"
+        )
+        print(log_msg)
+
         client.create_sensor_reading(payload)
 
         # --- 4. Tahmin Kontrolü ---
