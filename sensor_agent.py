@@ -72,9 +72,15 @@ def main():
     # --- YENİ KISIM: AÇILIŞ BEKLEMESİ ---
     print(f">>> Sistem başlatıldı. Sensör stabilizasyonu için {STARTUP_DELAY_SECONDS} sn bekleniyor...")
     time.sleep(STARTUP_DELAY_SECONDS)
-    print(">>> Bekleme tamamlandı. Bağlantılar kuruluyor...")
+    
+    # DÜZELTME 1: Sensörleri burada başlatıp değişkenlere atıyoruz
+    print(">>> Bekleme tamamlandı. Sensörler ve bağlantılar kuruluyor...")
+    bme, scd4x, pir = setup_sensors()
 
     client = PBClient(base_url=PB_BASE_URL)
+
+    # DÜZELTME 2: Döngüden önce zamanlayıcıyı başlatmazsak hata verir
+    last_forecast = time.time()
 
     while True:
         start_time = time.time()
@@ -84,6 +90,7 @@ def main():
         co2, raw_temp, hum, voc = None, None, None, 0.0
         
         # SCD41 Okuma
+        # scd4x değişkeni artık yukarıda tanımlandığı için bu blok çalışır
         if scd4x and scd4x.data_ready:
             try:
                 co2 = float(scd4x.CO2)
@@ -100,6 +107,8 @@ def main():
             except: pass
 
         if raw_temp is None:
+            # Eğer hiç sıcaklık okunamazsa (sensör hatası) bekle ve tekrar dene
+            print("[Uyarı] Sensör verisi okunamadı, tekrar deneniyor...")
             time.sleep(SENSOR_INTERVAL_SECONDS)
             continue
 
@@ -112,26 +121,30 @@ def main():
         # --- 3. Veri Hazırlama ---
         is_occupied = pir.motion_detected
         c_score = 0.5
-        if co2:
-            c_score = calc_comfort_score(comp_temp, hum, co2, voc)
+        # co2 değeri varsa hesapla, yoksa varsayılan kalır veya BME ile hesaplanabilir
+        if co2 or raw_temp: 
+             # Not: calc_comfort_score parametrelerini kontrol edin, co2 None ise hata verebilir.
+             # Basit bir check:
+             safe_co2 = co2 if co2 else 400
+             c_score = calc_comfort_score(comp_temp, hum, safe_co2, voc)
 
         payload = {
+            "place_id": config.PLACE_ID, # Config dosyasındaki ID'yi eklemeyi unutmayın
             "recorded_at": loop_ts.strftime("%Y-%m-%d %H:%M:%SZ"),
             "pir_occupied": is_occupied,
             "temp_c": round(comp_temp, 2),
             "rh_percent": round(hum, 2) if hum else 0,
             "voc_index": round(voc, 2),
-            "co2_ppm": co2,
+            "co2_ppm": co2 if co2 else 0,
             "comfort_score": c_score,
         }
 
-        # --- GÃœNCELLENEN LOG SATIRI ---
-        # TÃ¼m verileri tek satÃ½rda ama okunabilir gÃ¶relim:
+        # --- LOGLAMA ---
         log_msg = (
             f"[{loop_ts.strftime('%H:%M:%S')}] "
-            f"CPU:{cpu_temp:.1f}Â°C | "
-            f"Ham:{raw_temp:.1f}Â°C -> "
-            f"Net:{comp_temp:.2f}Â°C | "
+            f"CPU:{cpu_temp:.1f}°C | "
+            f"Ham:{raw_temp:.1f}°C -> "
+            f"Net:{comp_temp:.2f}°C | "
             f"Nem:%{hum:.1f} | "
             f"VOC:{voc:.1f} | "
             f"CO2:{co2 if co2 else '---'} ppm | "
@@ -139,9 +152,13 @@ def main():
         )
         print(log_msg)
 
-        client.create_sensor_reading(payload)
+        try:
+            client.create_sensor_reading(payload)
+        except Exception as e:
+            print(f"[Hata] Veri gönderilemedi: {e}")
 
         # --- 4. Tahmin Kontrolü ---
+        # last_forecast artık tanımlı olduğu için burası hata vermez
         if time.time() - last_forecast > FORECAST_INTERVAL_SECONDS:
             try:
                 run_forecast_logic(client)
