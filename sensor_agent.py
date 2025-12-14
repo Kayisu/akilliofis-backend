@@ -7,12 +7,11 @@ from gpiozero import MotionSensor
 from adafruit_bme680 import Adafruit_BME680_I2C
 from adafruit_scd4x import SCD4X
 
-# config dosyasından tüm ayarları çekiyoruz
 from config import (
     PB_ADMIN_EMAIL, PB_ADMIN_PASSWORD, PB_BASE_URL,
     SENSOR_INTERVAL_SECONDS, TEMP_CORRECTION_FACTOR, 
     STARTUP_DELAY_SECONDS, PLACE_ID,
-    WARMUP_SKIP_COUNT, GAS_HISTORY_LEN 
+    WARMUP_SKIP_COUNT, GAS_HISTORY_LEN, TEMP_HISTORY_LEN
 )
 from comfort import calc_comfort_score
 from pb_client import PBClient
@@ -49,12 +48,8 @@ def get_cpu_temperature() -> float:
         return 50.0
 
 def process_gas_resistance(gas_ohms):
-    """
-    BME680 Ham Direnç -> VOC Index (0-500)
-    """
     if gas_ohms is None: return 50.0
     if gas_ohms >= 50000: return 25.0
-    
     index = (-0.01 * gas_ohms) + 550
     return max(0.0, min(500.0, index))
 
@@ -62,11 +57,12 @@ def main():
     print(f">>> Sistem başlatıldı. Donanım hazırlığı için {STARTUP_DELAY_SECONDS} sn bekleniyor...")
     time.sleep(STARTUP_DELAY_SECONDS)
     
-    print(">>> Sensör nesneleri oluşturuluyor...")
+    print(">>> Sensörler nesneleri oluşturuluyor...")
     bme, scd4x, pir = setup_sensors()
     
-    # Config'den gelen uzunluk ile deque oluşturuluyor
+    # --- Tampon Bellekler (Buffer) ---
     gas_readings = deque(maxlen=GAS_HISTORY_LEN)
+    temp_readings = deque(maxlen=TEMP_HISTORY_LEN) # <-- YENİ
 
     if not pir:
         print("Sensör hatası (I2C), çıkılıyor.")
@@ -116,52 +112,54 @@ def main():
             time.sleep(SENSOR_INTERVAL_SECONDS)
             continue
 
-        # --- Veri İşleme ---
-        if instant_gas:
-            gas_readings.append(instant_gas)
+        # --- 2. Veri İşleme (Smoothing) ---
         
+        # A. Gaz (VOC)
+        if instant_gas: gas_readings.append(instant_gas)
         avg_gas_ohms = sum(gas_readings) / len(gas_readings) if gas_readings else 50000.0
         voc_index = process_gas_resistance(avg_gas_ohms)
         
+        # B. Sıcaklık (CPU Düzeltmeli + Smoothing)
         cpu_temp = get_cpu_temperature()
-        comp_temp = raw_temp
+        
+        # Anlık hesaplanan net sıcaklık
+        current_comp_temp = raw_temp
         if cpu_temp > raw_temp:
-            comp_temp = raw_temp - ((cpu_temp - raw_temp) / TEMP_CORRECTION_FACTOR)
+            current_comp_temp = raw_temp - ((cpu_temp - raw_temp) / TEMP_CORRECTION_FACTOR)
+            
+        # Listeye ekle ve ortalamasını al
+        temp_readings.append(current_comp_temp)
+        avg_temp = sum(temp_readings) / len(temp_readings) # <-- ARTIK BUNU KULLANACAĞIZ
         
         is_occupied = pir.motion_detected
         safe_co2 = co2 if co2 else 400
         
-        c_score = calc_comfort_score(comp_temp, hum, safe_co2, voc_index)
+        # Konforu artık ORTALAMA sıcaklığa göre hesapla
+        c_score = calc_comfort_score(avg_temp, hum, safe_co2, voc_index)
 
         # --- LOGLAMA ---
         status_tag = "ISINMA" if reading_counter < WARMUP_SKIP_COUNT else "KAYIT "
         
         log_msg = (
             f"[{loop_ts.strftime('%H:%M:%S')}] {status_tag} | "
-            f"CPU:{cpu_temp:.1f}°C | "
-            f"HamT:{raw_temp:.1f}°C | "
-            f"NetT:{comp_temp:.1f}°C | "
-            f"Nem:%{hum:.0f} | "
-            f"CO2:{co2 if co2 else '---'} | "
-            f"Ohm:{instant_gas:.0f} (Avg:{avg_gas_ohms:.0f}) | "
+            f"CPU:{cpu_temp:.1f} | "
+            f"Net(Anlık):{current_comp_temp:.2f} | " # CPU gürültülü hali
+            f"Net(Avg):{avg_temp:.2f} | "            # Ütülenmiş hali
             f"VOC:{voc_index:.0f} | "
-            f"PIR:{1 if is_occupied else 0} | "
             f"Skor:{c_score:.2f}"
         )
         print(log_msg)
 
-        # --- ISINMA BEKLEMESİ ---
         if reading_counter < WARMUP_SKIP_COUNT:
             reading_counter += 1
             time.sleep(SENSOR_INTERVAL_SECONDS)
             continue
 
-        # --- VERİTABANI KAYDI ---
         payload = {
-            "place_id": PLACE_ID,  # <-- DÜZELTİLDİ: Artık hangi ofise ait olduğunu biliyor
+            "place_id": PLACE_ID,
             "recorded_at": loop_ts.strftime("%Y-%m-%d %H:%M:%SZ"),
             "pir_occupied": is_occupied,
-            "temp_c": round(comp_temp, 2),
+            "temp_c": round(avg_temp, 2), # Veritabanına stabil sıcaklık gidiyor
             "rh_percent": round(hum, 2) if hum else 0,
             "voc_index": round(voc_index, 0),
             "co2_ppm": co2 if co2 else 0,
