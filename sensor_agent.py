@@ -62,7 +62,7 @@ def main():
     print(f">>> Sistem başlatıldı. Donanım hazırlığı için {STARTUP_DELAY_SECONDS} sn bekleniyor...")
     time.sleep(STARTUP_DELAY_SECONDS)
     
-    print(">>> Sensörler nesneleri oluşturuluyor...")
+    print(">>> Sensör nesneleri oluşturuluyor...")
     bme, scd4x, pir = setup_sensors()
     
     # Config'den gelen uzunluk ile deque oluşturuluyor

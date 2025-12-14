@@ -1,86 +1,100 @@
-import math
-
 def calculate_thermal_score(temp_c: float, rh: float) -> float:
     """
-    Termal konfor (Sıcaklık + Nem).
-    İdeal: 21-25.5 °C arası.
+    ASHRAE Standard 55 (Ofis/Sedanter Çalışma) Bazlı Puanlama.
+    Mükemmel Aralık: 21°C - 24°C
+    Kabul Edilebilir: 20°C - 26°C
     """
-    if temp_c is None or rh is None:
-        return 0.0
+    if temp_c is None or rh is None: return 0.0
 
-    target_temp = 23.5 
+    # --- 1. Sıcaklık Puanı (Parçalı Fonksiyon) ---
+    # Profesyonel yaklaşım: "Hedef" tek bir nokta değil, bir aralıktır (Band).
+    if 21.0 <= temp_c <= 24.0:
+        t_score = 1.0  # Altın Bölge
+    elif 20.0 <= temp_c < 21.0:
+        # 20'den 21'e çıkarken puan 0.8'den 1.0'a çıkar
+        t_score = 0.8 + ((temp_c - 20.0) * 0.2)
+    elif 24.0 < temp_c <= 26.0:
+        # 24'ten 26'ya çıkarken puan 1.0'dan 0.7'ye düşer
+        t_score = 1.0 - ((temp_c - 24.0) * 0.15)
+    elif temp_c < 18.0 or temp_c > 30.0:
+        t_score = 0.0  # Çok soğuk veya çok sıcak
+    else:
+        # Kalan ara bölgeler (18-20 arası ve 26-30 arası)
+        if temp_c < 20.0:
+            t_score = 0.5 + ((temp_c - 18.0) * 0.15)
+        else:
+            t_score = 0.7 - ((temp_c - 26.0) * 0.175)
+
+    # --- 2. Nem Cezası (ASHRAE) ---
+    # İdeal: %30 - %60
+    rh_penalty = 0.0
+    if rh < 30:
+        # %20 nemde %10 ceza, %0 nemde %20 ceza
+        rh_penalty = (30 - rh) * 0.005 
+    elif rh > 60:
+        # %80 nemde %20 ceza
+        rh_penalty = (rh - 60) * 0.01
     
-    # Nem etkisi (Basitleştirilmiş)
-    # Nem %30-60 arasıysa ceza yok (1.0).
-    # Dışındaysa sıcaklık farkını biraz daha "kötü" hissettirir.
-    humidity_penalty = 1.0
-    if rh > 60:
-        humidity_penalty = 1.0 + ((rh - 60) / 200.0) # Daha yumuşak eğim
-    elif rh < 30:
-        humidity_penalty = 1.05 
-
-    temp_diff = abs(temp_c - target_temp) * humidity_penalty
-
-    # Gaussian dağılımı (Çan eğrisi)
-    # Sigma değerini 3.5'ten 4.0'a çıkardım. 
-    # Bu, sıcaklık değişimlerine karşı skoru biraz daha toleranslı yapar.
-    thermal_score = math.exp(-(temp_diff**2) / (2 * (4.0**2)))
-
-    return thermal_score
+    # Sıcaklık puanından nem cezasını düş (Minimum 0)
+    final_score = max(0.0, t_score - rh_penalty)
+    return final_score
 
 def calculate_iaq_score(co2: float, voc_index: float) -> float:
     """
-    İç Hava Kalitesi (IAQ).
-    Burada VOC'un etkisini azalttık, CO2'yi ana belirleyici yaptık.
+    WELL Building Standard & UBA (Alman Çevre Ajansı) Bazlı.
     """
-    # --- 1. CO2 Skoru (Ana Faktör) ---
+    # --- 1. CO2 Puanı (WELL Standardı) ---
+    # < 800 ppm: Mükemmel
+    # 800-1000: İyi
+    # 1000-1500: İdare Eder
+    # > 1500: Kötü
+    
     if co2 is None: co2_score = 0.0
-    else:
-        # < 800 ppm: Mükemmel
-        # 800 - 1500 ppm: Yavaş düşüş
-        # > 1500 ppm: Hızlı düşüş
-        if co2 <= 800:
-            co2_score = 1.0
-        elif co2 >= 2500: # Üst limiti artırdım, hemen 0 olmasın
-            co2_score = 0.0
-        else:
-            # Lineer bir düşüş yerine yumuşak bir curve
-            co2_score = 1.0 - ((co2 - 800) / 1700.0) ** 1.2
+    elif co2 <= 800:
+        co2_score = 1.0
+    elif 800 < co2 <= 1000:
+        # 800->1.0, 1000->0.80 (Lineer düşüş)
+        co2_score = 1.0 - ((co2 - 800) * 0.001) 
+    elif 1000 < co2 <= 1500:
+        # 1000->0.80, 1500->0.50 (Daha sert düşüş)
+        co2_score = 0.80 - ((co2 - 1000) * 0.0006)
+    else: # > 1500
+        # 1500->0.50, 2500->0.0
+        co2_score = max(0.0, 0.50 - ((co2 - 1500) * 0.0005))
 
-    # --- 2. VOC Skoru (Yardımcı Faktör) ---
+    # --- 2. VOC Puanı (BME680 Index -> UBA Sınıfları) ---
+    # 0-50: Seviye 1 (Mükemmel)
+    # 51-100: Seviye 2 (İyi)
+    # 101-150: Seviye 3 (Orta)
+    # 151-200: Seviye 4 (Kötü)
+    # 201+: Seviye 5 (Çok Kötü)
+    
     if voc_index is None: voc_score = 0.5
+    elif voc_index <= 50:
+        voc_score = 1.0
+    elif voc_index <= 100:
+        # 50->1.0, 100->0.8
+        voc_score = 1.0 - ((voc_index - 50) * 0.004)
+    elif voc_index <= 200:
+        # 100->0.8, 200->0.4
+        voc_score = 0.8 - ((voc_index - 100) * 0.004)
     else:
-        # 0-100: İyi
-        # 100-300: Orta
-        # > 300: Kötü
-        if voc_index <= 100:
-            voc_score = 1.0
-        elif voc_index >= 450:
-            voc_score = 0.0
-        else:
-            voc_score = 1.0 - ((voc_index - 100) / 350.0)
+        # 200->0.4, 400->0.0
+        voc_score = max(0.0, 0.4 - ((voc_index - 200) * 0.002))
 
-    # --- BİRLEŞTİRME ---
-    # ESKİ: En kötü olan belirler (Min kuralı) -> Sıçrama yapar.
-    # YENİ: Ağırlıklı Ortalama.
-    # Karbondioksit (Havasızlık) daha somut bir veridir, %70 etkilesin.
-    # VOC (Koku/Kimyasal) biraz daha oynaktır, %30 etkilesin.
-    
-    final_air_score = (0.7 * co2_score) + (0.3 * voc_score)
-    
-    return final_air_score
+    # WELL Standardında en zayıf halka önemlidir ama biz yine de 
+    # CO2'ye ağırlık verelim çünkü sensörü (SCD41) daha güvenilirdir.
+    return (0.75 * co2_score) + (0.25 * voc_score)
 
 def calc_comfort_score(temp_c, rh, co2, voc_index) -> float:
     """
-    Genel Ofis Konfor Skoru (0.0 - 1.0)
-    Sıçramaları önlemek için 'Penalty/Ceza' mantığı kaldırıldı.
+    Genel Skor (ASHRAE 55 + WELL)
     """
     t_score = calculate_thermal_score(temp_c, rh)
     air_score = calculate_iaq_score(co2, voc_index)
 
-    # Ağırlıklar: Isıl konfor hala insan hissiyatı için en önemlisidir.
+    # İnsanlar termal konforu (sıcak/soğuk) hava kalitesinden daha çabuk hisseder.
     # %60 Termal, %40 Hava Kalitesi
     base_score = (0.6 * t_score) + (0.4 * air_score)
 
-    # Sınırlandırma (Clamping)
     return round(max(0.0, min(1.0, base_score)), 2)
