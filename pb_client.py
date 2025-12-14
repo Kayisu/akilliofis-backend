@@ -75,3 +75,22 @@ class PBClient:
             requests.post(url, json=payload, headers=self._auth_headers(), timeout=5)
         except Exception as e:
             print(f"[PB] Tahmin gönderme hatası: {e}")
+            
+    def get_historical_readings(self, days=7) -> List[Dict[str, Any]]:
+        url = f"{self.base_url}/api/collections/sensor_readings/records"
+        
+        # PocketBase tarih formatı UTC gerektirir
+        start_date = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days))
+        start_str = start_date.strftime("%Y-%m-%d %H:%M:%SZ")
+        
+        params = {
+            "sort": "-created",
+            "perPage": 500, # İhtiyaca göre artırılabilir
+            "filter": f"place_id='{PLACE_ID}' && created >= '{start_str}'"
+        }
+        try:
+            r = requests.get(url, params=params, headers=self._auth_headers(), timeout=10)
+            return r.json().get("items", [])
+        except Exception as e:
+            print(f"[PB] Geçmiş veri çekme hatası: {e}")
+            return []

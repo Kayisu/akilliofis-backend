@@ -1,79 +1,99 @@
-# forecaster.py
-
 import datetime
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
-from config import PB_BASE_URL, PB_ADMIN_EMAIL, PB_ADMIN_PASSWORD
+from config import PB_BASE_URL, PB_ADMIN_EMAIL, PB_ADMIN_PASSWORD, PLACE_ID
 from pb_client import PBClient
 
 def run_forecast_cycle():
-    print("\n--- [Forecaster] Tahmin döngüsü tetiklendi ---")
+    print(f"\n[{datetime.datetime.now().strftime('%H:%M:%S')}] --- Forecaster Başlatılıyor ---")
     client = PBClient(base_url=PB_BASE_URL)
     
-    # Login olmayı dene
     try:
         client.login_with_password(PB_ADMIN_EMAIL, PB_ADMIN_PASSWORD)
     except Exception as e:
-        print(f"[Forecaster] Login hatası: {e}")
+        print(f"[Forecaster] Kritik: Login hatası: {e}")
         return
 
-    # Veri çek
+    # Senin eklediğin metod burada kullanılıyor
+    print("[Forecaster] Geçmiş veriler çekiliyor...")
     records = client.get_historical_readings(days=7)
+    
     if len(records) < 50:
-        print("[Forecaster] Yetersiz veri (min 50 kayıt). Pas geçiliyor.")
+        print(f"[Forecaster] Yetersiz veri ({len(records)} kayıt). En az 50 kayıt gerekli. Çıkılıyor.")
         return
 
-    # Veri Hazırlığı
+    # --- Veri Hazırlığı ---
     df = pd.DataFrame(records)
+    
+    # PocketBase'den gelen tarih stringini datetime'a çevir
     df['recorded_at'] = pd.to_datetime(df['recorded_at'])
+    
+    # Feature Engineering (Saat ve Haftanın Günü)
     df['hour'] = df['recorded_at'].dt.hour
     df['day_of_week'] = df['recorded_at'].dt.dayofweek
     
-    # Pir sensörünü sayısal yap (True->1, False->0)
-    df['pir_occupied'] = df['pir_occupied'].astype(int)
+    # Boolean -> Int
+    if 'pir_occupied' in df.columns:
+        df['pir_occupied'] = df['pir_occupied'].astype(int)
+    else:
+        # Eski verilerde sütun yoksa 0 bas
+        df['pir_occupied'] = 0
     
-    # Eksik konfor verilerini ortalama ile doldur
+    # Eksik verileri temizle
     if df['comfort_score'].isnull().any():
-        df['comfort_score'].fillna(df['comfort_score'].mean(), inplace=True)
+        df['comfort_score'] = df['comfort_score'].fillna(df['comfort_score'].mean())
 
-    # Eğitim
-    print(f"[Forecaster] Model eğitiliyor... (Veri: {len(df)} satır)")
+    print(f"[Forecaster] Model eğitiliyor (Veri Seti: {len(df)} satır)...")
+    
     X = df[['hour', 'day_of_week']]
+    y_occ = df['pir_occupied']
+    y_comf = df['comfort_score']
     
-    # Doluluk Modeli
-    model_occ = RandomForestRegressor(n_estimators=50, random_state=42)
-    model_occ.fit(X, df['pir_occupied'])
+    # Modeller
+    model_occ = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+    model_occ.fit(X, y_occ)
     
-    # Konfor Modeli
-    model_comf = RandomForestRegressor(n_estimators=50, random_state=42)
-    model_comf.fit(X, df['comfort_score'])
+    model_comf = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
+    model_comf.fit(X, y_comf)
 
-    # Tahmin (Gelecek 24 Saat)
+    # --- Gelecek 24 Saat Tahmini ---
     now = datetime.datetime.now(datetime.timezone.utc)
-    current_hour = now.replace(minute=0, second=0, microsecond=0)
+    # Dakika ve saniyeyi sıfırla, önümüzdeki tam saatten başla
+    current_hour = now.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1)
     
-    print("[Forecaster] Tahminler veritabanına yazılıyor:")
+    print("[Forecaster] Gelecek 24 saat tahminleniyor ve DB'ye yazılıyor...")
     
-    for i in range(1, 169):
+    forecast_count = 0
+    for i in range(24): # 24 saatlik döngü
         future_time = current_hour + datetime.timedelta(hours=i)
         
-        # Girdi hazırla
+        # Modele girecek veri
         input_data = pd.DataFrame([[future_time.hour, future_time.weekday()]], 
                                 columns=['hour', 'day_of_week'])
         
-        pred_occ = model_occ.predict(input_data)[0]
-        pred_comf = model_comf.predict(input_data)[0]
+        pred_occ = float(model_occ.predict(input_data)[0])
+        pred_comf = float(model_comf.predict(input_data)[0])
         
-        # --- İŞTE BU SATIRI GERİ EKLEDİK ---
-        print(f"   -> Saat {future_time.hour:02d}:00 | Doluluk: %{int(pred_occ*100)} | Konfor: {pred_comf:.2f}")
+        # Sınırlandırmalar (Clamping)
+        pred_occ = max(0.0, min(1.0, pred_occ))
+        pred_comf = max(0.0, min(1.0, pred_comf))
         
-        # Kaydet
-        client.create_forecast(
-            target_ts=future_time.strftime("%Y-%m-%d %H:%M:%SZ"),
-            occupancy=pred_occ,
-            comfort=pred_comf
-        )
-        
-    print("[Forecaster] Döngü başarıyla tamamlandı.\n")
+        # Konsola örnek çıktı (ilk 3 saat ve son saat)
+        if i < 3 or i == 23:
+            print(f"   -> {future_time.strftime('%H:%M')} | Doluluk: %{int(pred_occ*100)} | Konfor: {pred_comf:.2f}")
 
+        # DB'ye Yaz
+        try:
+            client.create_forecast(
+                target_ts=future_time,
+                occupancy=pred_occ,
+                comfort=pred_comf
+            )
+            forecast_count += 1
+        except Exception as e:
+            print(f"[Forecaster] Yazma hatası ({future_time}): {e}")
 
+    print(f"[Forecaster] Tamamlandı. {forecast_count} adet tahmin oluşturuldu.")
+
+if __name__ == "__main__":
+    run_forecast_cycle()
