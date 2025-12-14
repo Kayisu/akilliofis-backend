@@ -14,7 +14,7 @@ from config import (
 from comfort import calc_comfort_score
 from pb_client import PBClient
 
-# İlk okumalar (özellikle VOC) sapabilir
+#ilk okumalar sapabilir.
 WARMUP_SKIP_COUNT = 12 
 
 def setup_sensors():
@@ -62,6 +62,7 @@ def main():
     print(">>> PocketBase bağlantısı kuruluyor...")
     client = PBClient(base_url=PB_BASE_URL)
     
+    # Bağlantı Retry Mantığı
     logged_in = False
     while not logged_in:
         try:
@@ -81,7 +82,7 @@ def main():
         start_time = time.time()
         loop_ts = datetime.datetime.now(datetime.timezone.utc)
         
-        # Sensör Okuma 
+        # --- 1. Sensör Okuma ---
         co2, raw_temp, hum, voc = None, None, None, 0.0
         
         if scd4x and scd4x.data_ready:
@@ -104,17 +105,18 @@ def main():
             time.sleep(SENSOR_INTERVAL_SECONDS)
             continue
 
-        # Sensör verileri ısındıktan sonra ilk okumalar sapabilir
+        # --- ISINMA (WARM-UP) KONTROLÜ ---
         if reading_counter < WARMUP_SKIP_COUNT:
-            print(f"[Isınma Modu] Veriler stabilizasyon için atlanıyor... ({reading_counter + 1}/{WARMUP_SKIP_COUNT}) | Ham VOC: {voc}")
+            print(f"[Isınma Modu] Veriler atlanıyor... ({reading_counter + 1}/{WARMUP_SKIP_COUNT}) | Ham VOC: {voc}")
             reading_counter += 1
             time.sleep(SENSOR_INTERVAL_SECONDS)
             continue
 
+        # --- 2. Veri İşleme ---
         cpu_temp = get_cpu_temperature()
         comp_temp = raw_temp
         
-        # CPU ısısı sensörü etkilediği için düzeltme
+        # Sıcaklık Düzeltme Formülü (CPU ısısı sensörü etkiliyorsa)
         if cpu_temp > raw_temp:
             comp_temp = raw_temp - ((cpu_temp - raw_temp) / TEMP_CORRECTION_FACTOR)
         
@@ -133,9 +135,12 @@ def main():
             "comfort_score": c_score,
         }
 
+        # --- GÜNCELLENMİŞ LOG FORMATI ---
         log_msg = (
             f"[{loop_ts.strftime('%H:%M:%S')}] "
-            f"Net:{comp_temp:.1f}°C | "
+            f"CPU:{cpu_temp:.1f}°C | "      # YENİ
+            f"Ham:{raw_temp:.1f}°C | "      # YENİ
+            f"Net:{comp_temp:.1f}°C | "     # İşlenmiş
             f"Nem:%{hum:.0f} | "
             f"CO2:{co2 if co2 else '---'} | "
             f"VOC:{voc:.0f} | "
@@ -148,8 +153,6 @@ def main():
             client.create_sensor_reading(payload)
         except Exception as e:
             print(f"[Hata] Veri gönderimi başarısız: {e}")
-            # Token süresi dolmuş olabilir, basitçe yeniden login denenebilir
-            # ama şimdilik akışı bozmayalım.
 
         elapsed = time.time() - start_time
         time.sleep(max(0, SENSOR_INTERVAL_SECONDS - elapsed))
