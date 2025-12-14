@@ -5,10 +5,10 @@ from sklearn.ensemble import RandomForestRegressor
 from config import PB_BASE_URL, PB_ADMIN_EMAIL, PB_ADMIN_PASSWORD
 from pb_client import PBClient
 
-# --- COMFORT.PY MANTIĞINI BURAYA ALIYORUZ (Bağımlılık olmaması için) ---
-# Senin comfort.py dosyanın birebir aynısı
+# --- FİZİK MOTORU (COMFORT.PY MANTIĞI) ---
 def calculate_thermal_score(temp_c, rh):
     if temp_c is None or rh is None: return 0.0
+    # Sıcaklık Puanı
     if 21.0 <= temp_c <= 24.0:
         t_score = 1.0
     elif 20.0 <= temp_c < 21.0:
@@ -31,12 +31,14 @@ def calculate_thermal_score(temp_c, rh):
     return max(0.0, t_score - rh_penalty)
 
 def calculate_iaq_score(co2, voc_index):
+    # CO2 Puanı
     if co2 is None: co2_score = 0.0
     elif co2 <= 800: co2_score = 1.0
     elif co2 <= 1000: co2_score = 1.0 - ((co2 - 800) * 0.001) 
     elif co2 <= 1500: co2_score = 0.80 - ((co2 - 1000) * 0.0006)
     else: co2_score = max(0.0, 0.50 - ((co2 - 1500) * 0.0005))
 
+    # VOC Puanı
     if voc_index is None: voc_score = 0.5
     elif voc_index <= 50: voc_score = 1.0
     elif voc_index <= 100: voc_score = 1.0 - ((voc_index - 50) * 0.004)
@@ -51,29 +53,29 @@ def calc_derived_comfort(temp_c, rh, co2, voc):
     base_score = (0.6 * t_score) + (0.4 * air_score)
     return round(max(0.0, min(1.0, base_score)), 2)
 
-# --- FORECASTER ANA KOD ---
+# --- HAFTALIK TAHMİN ---
 
-def run_forecast_cycle():
-    print(f"\n[{datetime.datetime.now().strftime('%H:%M:%S')}] --- SENSOR BAZLI Forecaster Başlatılıyor ---")
+def run_weekly_forecast():
+    print(f"\n[{datetime.datetime.now().strftime('%H:%M:%S')}] --- HAFTALIK Forecaster (7 Gun) Baslatiliyor ---")
     
     client = PBClient(base_url=PB_BASE_URL)
     try:
         client.login_with_password(PB_ADMIN_EMAIL, PB_ADMIN_PASSWORD)
     except Exception as e:
-        print(f"[Forecaster] Kritik: Login hatası: {e}")
+        print(f"[Forecaster] Kritik: Login hatasi: {e}")
         return
 
     # Aktif Odaları Bul
     try:
         places = client.client.collection("places").get_full_list(query_params={"filter": "is_active=true"})
     except:
-        print("[Forecaster] Oda listesi çekilemedi.")
+        print("[Forecaster] Oda listesi cekilemedi.")
         return
 
     for place in places:
-        print(f"\n>> Oda Analizi: {place.name}")
+        print(f"\n>> Oda Analizi (Haftalik): {place.name}")
         
-        # 1. VERİ TOPLAMA
+        # 1. Gecmis Verileri Cek
         try:
             readings = client.client.collection("sensor_readings").get_full_list(
                 query_params={"filter": f"place_id='{place.id}'", "sort": "-recorded_at"}
@@ -85,13 +87,14 @@ def run_forecast_cycle():
             continue
 
         if len(readings) < 50:
-            print(f"   [Atlandı] Yetersiz veri.")
+            print(f"   [Atlandi] Yetersiz veri.")
             continue
 
-        # 2. VERİ SETİ HAZIRLIĞI
+        # 2. Egitim Veri Setini Hazirla
         data = []
         res_map = []
         for r in reservations:
+            # Tarihleri naive datetime'a cevir
             start = datetime.datetime.fromisoformat(r.start_ts.replace('Z', '+00:00')).replace(tzinfo=None)
             end = datetime.datetime.fromisoformat(r.end_ts.replace('Z', '+00:00')).replace(tzinfo=None)
             res_map.append({'start': start, 'end': end, 'count': r.attendee_count})
@@ -102,7 +105,7 @@ def run_forecast_cycle():
             else:
                 rec_time = record.recorded_at.replace(tzinfo=None)
             
-            # O anki rezervasyon durumu
+            # Gecmis rezervasyon durumu
             person_count = 0
             for r in res_map:
                 if r['start'] <= rec_time < r['end']:
@@ -113,7 +116,7 @@ def run_forecast_cycle():
                 'hour': rec_time.hour,
                 'day_of_week': rec_time.weekday(),
                 'person_count': person_count,
-                # HEDEFLERİMİZ ARTIK SENSÖR VERİLERİ
+                # Hedefler: Fiziksel degerler
                 'temp_c': record.temp_c,
                 'co2_ppm': record.co2_ppm,
                 'voc_index': record.voc_index,
@@ -121,23 +124,19 @@ def run_forecast_cycle():
             })
 
         df = pd.DataFrame(data)
-        
-        # Eksik verileri temizle
         df = df.fillna(method='ffill').fillna(method='bfill')
 
-        # 3. MODELLERİ EĞİT (Her sensör için ayrı model!)
+        # 3. Modelleri Egit (Sensör Davranislari)
         X = df[['hour', 'day_of_week', 'person_count']]
         
-        print("   [Eğitim] Sensör davranışları öğreniliyor (Temp, CO2, VOC)...")
-        
+        print("   [Egitim] Sensor modelleri egitiliyor...")
         model_temp = RandomForestRegressor(n_estimators=50, random_state=42).fit(X, df['temp_c'])
         model_co2 = RandomForestRegressor(n_estimators=50, random_state=42).fit(X, df['co2_ppm'])
         model_voc = RandomForestRegressor(n_estimators=50, random_state=42).fit(X, df['voc_index'])
-        # Nem genelde sabit gibidir ama onu da eğitelim
         model_rh = RandomForestRegressor(n_estimators=50, random_state=42).fit(X, df['rh_percent'])
 
-        # 4. GELECEĞİ SİMÜLE ET
-        # Eski tahminleri temizle
+        # 4. Gelecek 7 Gunu Simule Et
+        # Once eski tahminleri temizle
         try:
             olds = client.client.collection("forecasts").get_full_list(query_params={"filter": f"place_id='{place.id}'"})
             for o in olds: client.client.collection("forecasts").delete(o.id)
@@ -146,44 +145,51 @@ def run_forecast_cycle():
         now = datetime.datetime.now()
         current_hour = now.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1)
         
-        print("   [Simülasyon] Gelecek 24 saatin fiziksel koşulları hesaplanıyor...")
-
-        for i in range(24):
+        print("   [Simulasyon] 7 Gunluk (168 saat) tahmin olusturuluyor...")
+        
+        # 7 Gun * 24 Saat = 168 Iterasyon
+        forecast_count = 0
+        for i in range(24 * 7):
             future_time = current_hour + datetime.timedelta(hours=i)
             
-            # Gelecekteki doluluk
+            # Gelecek rezervasyon kontrolu
             future_people = 0
             for r in res_map:
                 if r['start'] <= future_time < r['end']:
                     future_people = r['count']
                     break
             
-            # Girdi
+            # Model Girdisi
             input_data = pd.DataFrame([[future_time.hour, future_time.weekday(), future_people]], 
                                     columns=['hour', 'day_of_week', 'person_count'])
             
-            # 1. ÖNCE SENSÖRLERİ TAHMİN ET
+            # A. Sensor Degerlerini Tahmin Et
             pred_temp = float(model_temp.predict(input_data)[0])
             pred_co2 = float(model_co2.predict(input_data)[0])
             pred_voc = float(model_voc.predict(input_data)[0])
             pred_rh = float(model_rh.predict(input_data)[0])
 
-            # 2. SONRA BU TAHMİNİ SENSÖR VERİLERİNDEN KONFORU HESAPLA (Fizik Motoru)
+            # B. Konfor Skorunu Hesapla
             final_comfort_score = calc_derived_comfort(pred_temp, pred_rh, pred_co2, pred_voc)
             
-            # 3. KAYDET
+            # C. Kaydet
             forecast_data = {
                 "place_id": place.id,
                 "target_ts": future_time.isoformat(),
                 "predicted_occupancy": future_people,
-                "predicted_comfort_score": final_comfort_score # Hesaplanan Fiziksel Skor
+                "predicted_comfort_score": final_comfort_score
             }
             
             try:
                 client.client.collection("forecasts").create(forecast_data)
+                forecast_count += 1
+                # Ilerleme gostergesi (her 24 saatte bir nokta koy)
+                if i % 24 == 0: print(".", end="", flush=True)
             except: pass
 
-    print(f"\n[Forecaster] Döngü tamamlandı. Kâhin sensörleri dinledi ve konuştu.")
+        print(f"\n   [Tamam] {forecast_count} saatlik veri sisteme yuklendi.")
+
+    print(f"\n[Forecaster] Haftalik analiz tamamlandi.")
 
 if __name__ == "__main__":
-    run_forecast_cycle()
+    run_weekly_forecast()
