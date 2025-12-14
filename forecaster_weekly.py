@@ -3,25 +3,44 @@ import requests
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
-from config import PB_BASE_URL, PB_ADMIN_EMAIL, PB_ADMIN_PASSWORD
+from config import PB_BASE_URL
 
-# --- 1. ÖZEL İSTEMCİ (Senin pb_client.py mantığıyla genişletildi) ---
+PB_ADMIN_EMAIL = "pi_script@domain.com"
+PB_ADMIN_PASSWORD = "12345678"
+
+# --- 1. ÖZEL İSTEMCİ (GÜNCELLENDİ) ---
 class ForecasterClient:
     def __init__(self, base_url):
         self.base_url = base_url
         self.token = None
 
     def login_admin(self, email, password):
-        # Admin girişi için farklı endpoint kullanılır
-        url = f"{self.base_url}/api/admins/auth-with-password"
         payload = {"identity": email, "password": password}
+        
+        # 1. Deneme: PocketBase v0.23+ (Yeni Süper Kullanıcılar)
+        url = f"{self.base_url}/api/collections/_superusers/auth-with-password"
+        
         try:
             r = requests.post(url, json=payload, timeout=10)
+            
+            # Eğer 404 alırsak, eski versiyon olabilir
+            if r.status_code == 404:
+                # 2. Deneme: Eski PocketBase (Admins)
+                url = f"{self.base_url}/api/admins/auth-with-password"
+                r = requests.post(url, json=payload, timeout=10)
+
+            # Hala başarısızsak ve 404 alıyorsak, belki normal kullanıcıdır?
+            if r.status_code == 404:
+                 # 3. Deneme: Normal Users Koleksiyonu
+                url = f"{self.base_url}/api/collections/users/auth-with-password"
+                r = requests.post(url, json=payload, timeout=10)
+
             if r.status_code == 200:
                 self.token = r.json().get("token")
-                print("✅ Admin girişi başarılı.")
+                print("✅ Giriş başarılı.")
             else:
                 print(f"❌ Giriş başarısız: {r.text}")
+                
         except Exception as e:
             print(f"❌ Bağlantı hatası: {e}")
 
@@ -34,8 +53,10 @@ class ForecasterClient:
     def get_active_places(self):
         url = f"{self.base_url}/api/collections/places/records"
         params = {"filter": "is_active=true", "perPage": 100}
-        r = requests.get(url, headers=self._headers(), params=params)
-        return r.json().get("items", [])
+        try:
+            r = requests.get(url, headers=self._headers(), params=params)
+            return r.json().get("items", [])
+        except: return []
 
     def get_readings(self, place_id, days=30):
         url = f"{self.base_url}/api/collections/sensor_readings/records"
@@ -45,23 +66,28 @@ class ForecasterClient:
             "sort": "-recorded_at",
             "perPage": 500
         }
-        r = requests.get(url, headers=self._headers(), params=params)
-        return r.json().get("items", [])
+        try:
+            r = requests.get(url, headers=self._headers(), params=params)
+            return r.json().get("items", [])
+        except: return []
 
     def get_reservations(self, place_id):
         url = f"{self.base_url}/api/collections/reservations/records"
         params = {"filter": f"place_id='{place_id}'", "perPage": 500}
-        r = requests.get(url, headers=self._headers(), params=params)
-        return r.json().get("items", [])
+        try:
+            r = requests.get(url, headers=self._headers(), params=params)
+            return r.json().get("items", [])
+        except: return []
 
     def delete_old_forecasts(self, place_id):
-        # Önce listele sonra sil (Toplu silme olmadığı için)
+        # Toplu silme olmadığı için önce listele sonra sil
         url_list = f"{self.base_url}/api/collections/forecasts/records"
-        r = requests.get(url_list, headers=self._headers(), params={"filter": f"place_id='{place_id}'", "perPage": 200})
-        items = r.json().get("items", [])
-        
-        for item in items:
-            requests.delete(f"{url_list}/{item['id']}", headers=self._headers())
+        try:
+            r = requests.get(url_list, headers=self._headers(), params={"filter": f"place_id='{place_id}'", "perPage": 200})
+            items = r.json().get("items", [])
+            for item in items:
+                requests.delete(f"{url_list}/{item['id']}", headers=self._headers())
+        except: pass
 
     def create_forecast(self, payload):
         url = f"{self.base_url}/api/collections/forecasts/records"
@@ -73,17 +99,22 @@ class ForecasterClient:
 # --- 2. FİZİK MOTORU (Konfor Hesaplama) ---
 def calc_comfort_score(temp, rh, co2, voc):
     # Sıcaklık Puanı (21-24 arası mükemmel)
+    if temp is None: temp = 22.0
     if 21.0 <= temp <= 24.0: t_score = 1.0
     elif 20.0 <= temp < 21.0: t_score = 0.8 + ((temp - 20.0) * 0.2)
     elif 24.0 < temp <= 26.0: t_score = 1.0 - ((temp - 24.0) * 0.15)
     else: t_score = 0.0
     
     # Nem Cezası
+    if rh is None: rh = 45.0
     rh_penalty = 0.0
     if rh < 30: rh_penalty = (30 - rh) * 0.005
     elif rh > 60: rh_penalty = (rh - 60) * 0.01
     
     # Hava Kalitesi Puanı
+    if co2 is None: co2 = 400
+    if voc is None: voc = 50
+    
     co2_score = 1.0 if co2 <= 800 else max(0.0, 1.0 - ((co2 - 800) / 1000.0))
     voc_score = 1.0 if voc <= 50 else max(0.0, 1.0 - ((voc - 50) * 0.004))
     
@@ -97,9 +128,12 @@ def run_weekly_forecast():
     print(f"\n[{datetime.datetime.now().strftime('%H:%M:%S')}] --- HAFTALIK Forecaster Başlatılıyor ---")
     
     client = ForecasterClient(PB_BASE_URL)
+    # Otomatik olarak doğru giriş yöntemini bulacaktır
     client.login_admin(PB_ADMIN_EMAIL, PB_ADMIN_PASSWORD)
     
-    if not client.token: return
+    if not client.token:
+        print("❌ Hiçbir giriş yöntemi çalışmadı. Lütfen kullanıcı adı/şifre ve sunucu adresini kontrol edin.")
+        return
 
     places = client.get_active_places()
     print(f"🏢 Analiz edilecek oda sayısı: {len(places)}")
@@ -120,7 +154,6 @@ def run_weekly_forecast():
         res_map = []
         
         for r in reservations:
-            # PocketBase tarih formatını temizle
             try:
                 start = datetime.datetime.fromisoformat(r['start_ts'].replace('Z', '+00:00')).replace(tzinfo=None)
                 end = datetime.datetime.fromisoformat(r['end_ts'].replace('Z', '+00:00')).replace(tzinfo=None)
@@ -148,6 +181,10 @@ def run_weekly_forecast():
                     'rh_percent': rec.get('rh_percent', 45.0)
                 })
             except: continue
+
+        if not data:
+            print("   ⚠️ Veri işlenemedi.")
+            continue
 
         df = pd.DataFrame(data).fillna(method='ffill').fillna(method='bfill')
         
