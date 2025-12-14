@@ -2,6 +2,7 @@ import time
 import datetime
 import board
 import busio
+from collections import deque
 from gpiozero import MotionSensor
 from adafruit_bme680 import Adafruit_BME680_I2C
 from adafruit_scd4x import SCD4X
@@ -14,8 +15,10 @@ from config import (
 from comfort import calc_comfort_score
 from pb_client import PBClient
 
-# Sensör ısındıktan sonra bile ilk okumalar sapabilir.
+# --- AYARLAR ---
 WARMUP_SKIP_COUNT = 12 
+# Son 10 veriyi hafızada tutup ortalamasını alacağız (Smoothing)
+GAS_HISTORY_LEN = 10 
 
 def setup_sensors():
     try:
@@ -50,29 +53,15 @@ def get_cpu_temperature() -> float:
 
 def process_gas_resistance(gas_ohms):
     """
-    BME680'den gelen ham Gaz Direncini (Ohm), 0-500 arası VOC İndeksine çevirir.
-    Mantık: 
-    - Yüksek Ohm (Temiz) -> Düşük Index (İyi)
-    - Düşük Ohm (Kirli) -> Yüksek Index (Kötü)
+    BME680 Ham Direnç -> VOC Index (0-500)
     """
-    if gas_ohms is None:
-        return 50.0 # Varsayılan: Temiz hava
-
-    # Referans Değerler (Basitleştirilmiş)
-    # 50.000 Ohm ve üzeri = Mükemmel Hava (Index 25)
-    # 10.000 Ohm = Kötüye giden hava (Index 200)
-    # 5.000 Ohm = Çok Kötü hava (Index 500)
+    if gas_ohms is None: return 50.0
     
-    if gas_ohms >= 50000:
-        return 25.0 # Çok İyi
-    
-    # 50k ile 5k arasını lineer olarak Index'e (50 -> 500) ters orantıla
-    # Formül: y = mx + c yaklaşımı
-    # Eğim hesabı: (500 - 50) / (5000 - 50000) = 450 / -45000 = -0.01
+    # 50k Ohm = Çok Temiz (Index 25)
+    # 5k Ohm = Çok Kirli (Index 500)
+    if gas_ohms >= 50000: return 25.0
     
     index = (-0.01 * gas_ohms) + 550
-    
-    # Sınırlandırma (Clamping)
     return max(0.0, min(500.0, index))
 
 def main():
@@ -81,6 +70,9 @@ def main():
     
     print(">>> Sensörler nesneleri oluşturuluyor...")
     bme, scd4x, pir = setup_sensors()
+    
+    # --- YENİ: Geçmiş verileri tutacak liste (Buffer) ---
+    gas_readings = deque(maxlen=GAS_HISTORY_LEN)
 
     if not pir:
         print("Sensör hatası (I2C), çıkılıyor.")
@@ -108,8 +100,8 @@ def main():
         start_time = time.time()
         loop_ts = datetime.datetime.now(datetime.timezone.utc)
         
-        #Sensör Okuma
-        co2, raw_temp, hum, gas_ohms = None, None, None, 0.0
+        # --- 1. Sensör Okuma ---
+        co2, raw_temp, hum, instant_gas = None, None, None, None
         
         if scd4x and scd4x.data_ready:
             try:
@@ -122,7 +114,7 @@ def main():
             try:
                 if raw_temp is None: raw_temp = float(bme.temperature)
                 if hum is None: hum = float(bme.humidity)
-                gas_ohms = float(bme.gas) 
+                instant_gas = float(bme.gas)
             except: pass
 
         if raw_temp is None:
@@ -130,22 +122,35 @@ def main():
             time.sleep(SENSOR_INTERVAL_SECONDS)
             continue
 
-        # Isınma Kontrolü
+        # --- Isınma Kontrolü ---
         if reading_counter < WARMUP_SKIP_COUNT:
-            print(f"[Isınma Modu] ({reading_counter + 1}/{WARMUP_SKIP_COUNT}) | Ohm: {gas_ohms:.0f}")
+            # Isınma sırasında bile buffer'ı doldurmaya başlayalım
+            if instant_gas: gas_readings.append(instant_gas)
+            
+            print(f"[Isınma Modu] ({reading_counter + 1}/{WARMUP_SKIP_COUNT}) | Ohm: {instant_gas if instant_gas else '---'}")
             reading_counter += 1
             time.sleep(SENSOR_INTERVAL_SECONDS)
             continue
 
-        #Veri İşleme ve Dönüştürme 
+        # --- 2. Veri İşleme (Smoothing) ---
+        
+        # Anlık gaz değerini listeye ekle (Listenin sonuna ekler, başından atar)
+        if instant_gas:
+            gas_readings.append(instant_gas)
+        
+        # Ortalamayı al
+        if len(gas_readings) > 0:
+            avg_gas_ohms = sum(gas_readings) / len(gas_readings)
+        else:
+            avg_gas_ohms = 50000.0 # Varsayılan temiz
+            
         cpu_temp = get_cpu_temperature()
         comp_temp = raw_temp
-        
         if cpu_temp > raw_temp:
             comp_temp = raw_temp - ((cpu_temp - raw_temp) / TEMP_CORRECTION_FACTOR)
         
-        
-        voc_index = process_gas_resistance(gas_ohms)
+        # Hesaplamaya ARTIK ORTALAMA değer giriyor
+        voc_index = process_gas_resistance(avg_gas_ohms)
         
         is_occupied = pir.motion_detected
         safe_co2 = co2 if co2 else 400
@@ -157,7 +162,7 @@ def main():
             "pir_occupied": is_occupied,
             "temp_c": round(comp_temp, 2),
             "rh_percent": round(hum, 2) if hum else 0,
-            "voc_index": round(voc_index, 0), 
+            "voc_index": round(voc_index, 0),
             "co2_ppm": co2 if co2 else 0,
             "comfort_score": c_score,
         }
@@ -165,8 +170,9 @@ def main():
         log_msg = (
             f"[{loop_ts.strftime('%H:%M:%S')}] "
             f"Net:{comp_temp:.1f}°C | "
-            f"Nem:%{hum:.0f} | "
-            f"VOC_Ohm:{gas_ohms:.0f} -> Index:{voc_index:.0f} | " 
+            f"Ohm(Anlık):{instant_gas:.0f} | "  # Logda anlık farkı gör
+            f"Ohm(Avg):{avg_gas_ohms:.0f} | "   # Logda yumuşatılmışı gör
+            f"Index:{voc_index:.0f} | "
             f"Skor:{c_score:.2f}" 
         )
         print(log_msg)
