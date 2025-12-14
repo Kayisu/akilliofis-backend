@@ -1,195 +1,208 @@
 import datetime
+import requests
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 from config import PB_BASE_URL, PB_ADMIN_EMAIL, PB_ADMIN_PASSWORD
-from pb_client import PBClient
 
-# --- FİZİK MOTORU (COMFORT.PY MANTIĞI) ---
-def calculate_thermal_score(temp_c, rh):
-    if temp_c is None or rh is None: return 0.0
-    # Sıcaklık Puanı
-    if 21.0 <= temp_c <= 24.0:
-        t_score = 1.0
-    elif 20.0 <= temp_c < 21.0:
-        t_score = 0.8 + ((temp_c - 20.0) * 0.2)
-    elif 24.0 < temp_c <= 26.0:
-        t_score = 1.0 - ((temp_c - 24.0) * 0.15)
-    elif temp_c < 18.0 or temp_c > 30.0:
-        t_score = 0.0
-    else:
-        if temp_c < 20.0:
-            t_score = 0.5 + ((temp_c - 18.0) * 0.15)
-        else:
-            t_score = 0.7 - ((temp_c - 26.0) * 0.175)
-            
+# --- 1. ÖZEL İSTEMCİ (Senin pb_client.py mantığıyla genişletildi) ---
+class ForecasterClient:
+    def __init__(self, base_url):
+        self.base_url = base_url
+        self.token = None
+
+    def login_admin(self, email, password):
+        # Admin girişi için farklı endpoint kullanılır
+        url = f"{self.base_url}/api/admins/auth-with-password"
+        payload = {"identity": email, "password": password}
+        try:
+            r = requests.post(url, json=payload, timeout=10)
+            if r.status_code == 200:
+                self.token = r.json().get("token")
+                print("✅ Admin girişi başarılı.")
+            else:
+                print(f"❌ Giriş başarısız: {r.text}")
+        except Exception as e:
+            print(f"❌ Bağlantı hatası: {e}")
+
+    def _headers(self):
+        return {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.token}" if self.token else ""
+        }
+
+    def get_active_places(self):
+        url = f"{self.base_url}/api/collections/places/records"
+        params = {"filter": "is_active=true", "perPage": 100}
+        r = requests.get(url, headers=self._headers(), params=params)
+        return r.json().get("items", [])
+
+    def get_readings(self, place_id, days=30):
+        url = f"{self.base_url}/api/collections/sensor_readings/records"
+        start_date = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days))
+        params = {
+            "filter": f"place_id='{place_id}' && created >= '{start_date.strftime('%Y-%m-%d %H:%M:%SZ')}'",
+            "sort": "-recorded_at",
+            "perPage": 500
+        }
+        r = requests.get(url, headers=self._headers(), params=params)
+        return r.json().get("items", [])
+
+    def get_reservations(self, place_id):
+        url = f"{self.base_url}/api/collections/reservations/records"
+        params = {"filter": f"place_id='{place_id}'", "perPage": 500}
+        r = requests.get(url, headers=self._headers(), params=params)
+        return r.json().get("items", [])
+
+    def delete_old_forecasts(self, place_id):
+        # Önce listele sonra sil (Toplu silme olmadığı için)
+        url_list = f"{self.base_url}/api/collections/forecasts/records"
+        r = requests.get(url_list, headers=self._headers(), params={"filter": f"place_id='{place_id}'", "perPage": 200})
+        items = r.json().get("items", [])
+        
+        for item in items:
+            requests.delete(f"{url_list}/{item['id']}", headers=self._headers())
+
+    def create_forecast(self, payload):
+        url = f"{self.base_url}/api/collections/forecasts/records"
+        try:
+            requests.post(url, json=payload, headers=self._headers())
+        except Exception as e:
+            print(f"⚠️ Yazma hatası: {e}")
+
+# --- 2. FİZİK MOTORU (Konfor Hesaplama) ---
+def calc_comfort_score(temp, rh, co2, voc):
+    # Sıcaklık Puanı (21-24 arası mükemmel)
+    if 21.0 <= temp <= 24.0: t_score = 1.0
+    elif 20.0 <= temp < 21.0: t_score = 0.8 + ((temp - 20.0) * 0.2)
+    elif 24.0 < temp <= 26.0: t_score = 1.0 - ((temp - 24.0) * 0.15)
+    else: t_score = 0.0
+    
     # Nem Cezası
     rh_penalty = 0.0
-    if rh < 30: rh_penalty = (30 - rh) * 0.005 
+    if rh < 30: rh_penalty = (30 - rh) * 0.005
     elif rh > 60: rh_penalty = (rh - 60) * 0.01
     
-    return max(0.0, t_score - rh_penalty)
-
-def calculate_iaq_score(co2, voc_index):
-    # CO2 Puanı
-    if co2 is None: co2_score = 0.0
-    elif co2 <= 800: co2_score = 1.0
-    elif co2 <= 1000: co2_score = 1.0 - ((co2 - 800) * 0.001) 
-    elif co2 <= 1500: co2_score = 0.80 - ((co2 - 1000) * 0.0006)
-    else: co2_score = max(0.0, 0.50 - ((co2 - 1500) * 0.0005))
-
-    # VOC Puanı
-    if voc_index is None: voc_score = 0.5
-    elif voc_index <= 50: voc_score = 1.0
-    elif voc_index <= 100: voc_score = 1.0 - ((voc_index - 50) * 0.004)
-    elif voc_index <= 200: voc_score = 0.8 - ((voc_index - 100) * 0.004)
-    else: voc_score = max(0.0, 0.4 - ((voc_index - 200) * 0.002))
-
-    return (0.75 * co2_score) + (0.25 * voc_score)
-
-def calc_derived_comfort(temp_c, rh, co2, voc):
-    t_score = calculate_thermal_score(temp_c, rh)
-    air_score = calculate_iaq_score(co2, voc)
-    base_score = (0.6 * t_score) + (0.4 * air_score)
-    return round(max(0.0, min(1.0, base_score)), 2)
-
-# --- HAFTALIK TAHMİN ---
-
-def run_weekly_forecast():
-    print(f"\n[{datetime.datetime.now().strftime('%H:%M:%S')}] --- HAFTALIK Forecaster (7 Gun) Baslatiliyor ---")
+    # Hava Kalitesi Puanı
+    co2_score = 1.0 if co2 <= 800 else max(0.0, 1.0 - ((co2 - 800) / 1000.0))
+    voc_score = 1.0 if voc <= 50 else max(0.0, 1.0 - ((voc - 50) * 0.004))
     
-    client = PBClient(base_url=PB_BASE_URL)
-    try:
-        client.login_with_password(PB_ADMIN_EMAIL, PB_ADMIN_PASSWORD)
-    except Exception as e:
-        print(f"[Forecaster] Kritik: Login hatasi: {e}")
-        return
+    air_score = (0.75 * co2_score) + (0.25 * voc_score)
+    
+    # Final Ağırlık (%60 Termal, %40 Hava)
+    return round(max(0.0, min(1.0, (0.6 * (t_score - rh_penalty)) + (0.4 * air_score))), 2)
 
-    # Aktif Odaları Bul
-    try:
-        places = client.client.collection("places").get_full_list(query_params={"filter": "is_active=true"})
-    except:
-        print("[Forecaster] Oda listesi cekilemedi.")
-        return
+# --- 3. ANA ÇALIŞMA DÖNGÜSÜ ---
+def run_weekly_forecast():
+    print(f"\n[{datetime.datetime.now().strftime('%H:%M:%S')}] --- HAFTALIK Forecaster Başlatılıyor ---")
+    
+    client = ForecasterClient(PB_BASE_URL)
+    client.login_admin(PB_ADMIN_EMAIL, PB_ADMIN_PASSWORD)
+    
+    if not client.token: return
+
+    places = client.get_active_places()
+    print(f"🏢 Analiz edilecek oda sayısı: {len(places)}")
 
     for place in places:
-        print(f"\n>> Oda Analizi (Haftalik): {place.name}")
+        print(f"\n>> Oda: {place.get('name')} ({place.get('id')})")
         
-        # 1. Gecmis Verileri Cek
-        try:
-            readings = client.client.collection("sensor_readings").get_full_list(
-                query_params={"filter": f"place_id='{place.id}'", "sort": "-recorded_at"}
-            )
-            reservations = client.client.collection("reservations").get_full_list(
-                query_params={"filter": f"place_id='{place.id}'"}
-            )
-        except:
-            continue
-
+        # Verileri Çek
+        readings = client.get_readings(place['id'])
+        reservations = client.get_reservations(place['id'])
+        
         if len(readings) < 50:
-            print(f"   [Atlandi] Yetersiz veri.")
+            print("   ⚠️ Yetersiz veri, atlanıyor.")
             continue
 
-        # 2. Egitim Veri Setini Hazirla
+        # Pandas DataFrame Hazırlığı
         data = []
         res_map = []
+        
         for r in reservations:
-            # Tarihleri naive datetime'a cevir
-            start = datetime.datetime.fromisoformat(r.start_ts.replace('Z', '+00:00')).replace(tzinfo=None)
-            end = datetime.datetime.fromisoformat(r.end_ts.replace('Z', '+00:00')).replace(tzinfo=None)
-            res_map.append({'start': start, 'end': end, 'count': r.attendee_count})
+            # PocketBase tarih formatını temizle
+            try:
+                start = datetime.datetime.fromisoformat(r['start_ts'].replace('Z', '+00:00')).replace(tzinfo=None)
+                end = datetime.datetime.fromisoformat(r['end_ts'].replace('Z', '+00:00')).replace(tzinfo=None)
+                res_map.append({'start': start, 'end': end, 'count': r['attendee_count']})
+            except: continue
 
-        for record in readings:
-            if isinstance(record.recorded_at, str):
-                rec_time = datetime.datetime.fromisoformat(record.recorded_at.replace('Z', '+00:00')).replace(tzinfo=None)
-            else:
-                rec_time = record.recorded_at.replace(tzinfo=None)
-            
-            # Gecmis rezervasyon durumu
-            person_count = 0
-            for r in res_map:
-                if r['start'] <= rec_time < r['end']:
-                    person_count = r['count']
-                    break
-            
-            data.append({
-                'hour': rec_time.hour,
-                'day_of_week': rec_time.weekday(),
-                'person_count': person_count,
-                # Hedefler: Fiziksel degerler
-                'temp_c': record.temp_c,
-                'co2_ppm': record.co2_ppm,
-                'voc_index': record.voc_index,
-                'rh_percent': record.rh_percent
-            })
+        for rec in readings:
+            try:
+                rec_time = datetime.datetime.fromisoformat(rec['recorded_at'].replace('Z', '+00:00')).replace(tzinfo=None)
+                
+                # O andaki kişi sayısı
+                p_count = 0
+                for r in res_map:
+                    if r['start'] <= rec_time < r['end']:
+                        p_count = r['count']
+                        break
+                
+                data.append({
+                    'hour': rec_time.hour,
+                    'day_of_week': rec_time.weekday(),
+                    'person_count': p_count,
+                    'temp_c': rec.get('temp_c', 22.0),
+                    'co2_ppm': rec.get('co2_ppm', 400),
+                    'voc_index': rec.get('voc_index', 50),
+                    'rh_percent': rec.get('rh_percent', 45.0)
+                })
+            except: continue
 
-        df = pd.DataFrame(data)
-        df = df.fillna(method='ffill').fillna(method='bfill')
-
-        # 3. Modelleri Egit (Sensör Davranislari)
+        df = pd.DataFrame(data).fillna(method='ffill').fillna(method='bfill')
+        
+        # Yapay Zeka Modellerini Eğit
         X = df[['hour', 'day_of_week', 'person_count']]
         
-        print("   [Egitim] Sensor modelleri egitiliyor...")
+        print("   🧠 Sensör modelleri eğitiliyor...")
         model_temp = RandomForestRegressor(n_estimators=50, random_state=42).fit(X, df['temp_c'])
         model_co2 = RandomForestRegressor(n_estimators=50, random_state=42).fit(X, df['co2_ppm'])
         model_voc = RandomForestRegressor(n_estimators=50, random_state=42).fit(X, df['voc_index'])
         model_rh = RandomForestRegressor(n_estimators=50, random_state=42).fit(X, df['rh_percent'])
 
-        # 4. Gelecek 7 Gunu Simule Et
-        # Once eski tahminleri temizle
-        try:
-            olds = client.client.collection("forecasts").get_full_list(query_params={"filter": f"place_id='{place.id}'"})
-            for o in olds: client.client.collection("forecasts").delete(o.id)
-        except: pass
-
+        # Gelecek 7 Günü Tahminle
+        print("   🔮 7 günlük tahmin oluşturuluyor...")
+        client.delete_old_forecasts(place['id'])
+        
         now = datetime.datetime.now()
-        current_hour = now.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1)
+        start_hour = now.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1)
         
-        print("   [Simulasyon] 7 Gunluk (168 saat) tahmin olusturuluyor...")
-        
-        # 7 Gun * 24 Saat = 168 Iterasyon
         forecast_count = 0
-        for i in range(24 * 7):
-            future_time = current_hour + datetime.timedelta(hours=i)
+        for i in range(168): # 7 Gün * 24 Saat
+            future_time = start_hour + datetime.timedelta(hours=i)
             
-            # Gelecek rezervasyon kontrolu
+            # Gelecek rezervasyon kontrolü
             future_people = 0
             for r in res_map:
                 if r['start'] <= future_time < r['end']:
                     future_people = r['count']
                     break
             
-            # Model Girdisi
-            input_data = pd.DataFrame([[future_time.hour, future_time.weekday(), future_people]], 
-                                    columns=['hour', 'day_of_week', 'person_count'])
+            # Tahmin İste
+            input_df = pd.DataFrame([[future_time.hour, future_time.weekday(), future_people]], 
+                                  columns=['hour', 'day_of_week', 'person_count'])
             
-            # A. Sensor Degerlerini Tahmin Et
-            pred_temp = float(model_temp.predict(input_data)[0])
-            pred_co2 = float(model_co2.predict(input_data)[0])
-            pred_voc = float(model_voc.predict(input_data)[0])
-            pred_rh = float(model_rh.predict(input_data)[0])
-
-            # B. Konfor Skorunu Hesapla
-            final_comfort_score = calc_derived_comfort(pred_temp, pred_rh, pred_co2, pred_voc)
+            pred_temp = float(model_temp.predict(input_df)[0])
+            pred_co2 = float(model_co2.predict(input_df)[0])
+            pred_voc = float(model_voc.predict(input_df)[0])
+            pred_rh = float(model_rh.predict(input_df)[0])
             
-            # C. Kaydet
-            forecast_data = {
-                "place_id": place.id,
-                "target_ts": future_time.isoformat(),
+            # Fizik Motoru ile Skoru Hesapla
+            final_score = calc_comfort_score(pred_temp, pred_rh, pred_co2, pred_voc)
+            
+            payload = {
+                "place_id": place['id'],
+                "target_ts": future_time.strftime("%Y-%m-%d %H:%M:%SZ"),
                 "predicted_occupancy": future_people,
-                "predicted_comfort_score": final_comfort_score
+                "predicted_comfort_score": final_score
             }
-            
-            try:
-                client.client.collection("forecasts").create(forecast_data)
-                forecast_count += 1
-                # Ilerleme gostergesi (her 24 saatte bir nokta koy)
-                if i % 24 == 0: print(".", end="", flush=True)
-            except: pass
+            client.create_forecast(payload)
+            forecast_count += 1
+            if i % 24 == 0: print(".", end="", flush=True)
 
-        print(f"\n   [Tamam] {forecast_count} saatlik veri sisteme yuklendi.")
+        print(f"\n   ✅ {forecast_count} saatlik veri yüklendi.")
 
-    print(f"\n[Forecaster] Haftalik analiz tamamlandi.")
+    print("\n--- Haftalık Analiz Tamamlandı ---")
 
 if __name__ == "__main__":
     run_weekly_forecast()
