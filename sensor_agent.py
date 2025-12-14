@@ -14,7 +14,7 @@ from config import (
 from comfort import calc_comfort_score
 from pb_client import PBClient
 
-#ilk okumalar sapabilir.
+# Sensör ısındıktan sonra bile ilk okumalar sapabilir.
 WARMUP_SKIP_COUNT = 12 
 
 def setup_sensors():
@@ -48,6 +48,33 @@ def get_cpu_temperature() -> float:
     except:
         return 50.0
 
+def process_gas_resistance(gas_ohms):
+    """
+    BME680'den gelen ham Gaz Direncini (Ohm), 0-500 arası VOC İndeksine çevirir.
+    Mantık: 
+    - Yüksek Ohm (Temiz) -> Düşük Index (İyi)
+    - Düşük Ohm (Kirli) -> Yüksek Index (Kötü)
+    """
+    if gas_ohms is None:
+        return 50.0 # Varsayılan: Temiz hava
+
+    # Referans Değerler (Basitleştirilmiş)
+    # 50.000 Ohm ve üzeri = Mükemmel Hava (Index 25)
+    # 10.000 Ohm = Kötüye giden hava (Index 200)
+    # 5.000 Ohm = Çok Kötü hava (Index 500)
+    
+    if gas_ohms >= 50000:
+        return 25.0 # Çok İyi
+    
+    # 50k ile 5k arasını lineer olarak Index'e (50 -> 500) ters orantıla
+    # Formül: y = mx + c yaklaşımı
+    # Eğim hesabı: (500 - 50) / (5000 - 50000) = 450 / -45000 = -0.01
+    
+    index = (-0.01 * gas_ohms) + 550
+    
+    # Sınırlandırma (Clamping)
+    return max(0.0, min(500.0, index))
+
 def main():
     print(f">>> Sistem başlatıldı. Donanım hazırlığı için {STARTUP_DELAY_SECONDS} sn bekleniyor...")
     time.sleep(STARTUP_DELAY_SECONDS)
@@ -62,7 +89,6 @@ def main():
     print(">>> PocketBase bağlantısı kuruluyor...")
     client = PBClient(base_url=PB_BASE_URL)
     
-    # Bağlantı Retry Mantığı
     logged_in = False
     while not logged_in:
         try:
@@ -82,8 +108,8 @@ def main():
         start_time = time.time()
         loop_ts = datetime.datetime.now(datetime.timezone.utc)
         
-        # --- 1. Sensör Okuma ---
-        co2, raw_temp, hum, voc = None, None, None, 0.0
+        #Sensör Okuma
+        co2, raw_temp, hum, gas_ohms = None, None, None, 0.0
         
         if scd4x and scd4x.data_ready:
             try:
@@ -94,10 +120,9 @@ def main():
 
         if bme:
             try:
-                # Eğer SCD'den alamadıysak BME'den al
                 if raw_temp is None: raw_temp = float(bme.temperature)
                 if hum is None: hum = float(bme.humidity)
-                voc = float(bme.gas) 
+                gas_ohms = float(bme.gas) 
             except: pass
 
         if raw_temp is None:
@@ -105,46 +130,43 @@ def main():
             time.sleep(SENSOR_INTERVAL_SECONDS)
             continue
 
-        # --- ISINMA (WARM-UP) KONTROLÜ ---
+        # Isınma Kontrolü
         if reading_counter < WARMUP_SKIP_COUNT:
-            print(f"[Isınma Modu] Veriler atlanıyor... ({reading_counter + 1}/{WARMUP_SKIP_COUNT}) | Ham VOC: {voc}")
+            print(f"[Isınma Modu] ({reading_counter + 1}/{WARMUP_SKIP_COUNT}) | Ohm: {gas_ohms:.0f}")
             reading_counter += 1
             time.sleep(SENSOR_INTERVAL_SECONDS)
             continue
 
-        # --- 2. Veri İşleme ---
+        #Veri İşleme ve Dönüştürme 
         cpu_temp = get_cpu_temperature()
         comp_temp = raw_temp
         
-        # Sıcaklık Düzeltme Formülü (CPU ısısı sensörü etkiliyorsa)
         if cpu_temp > raw_temp:
             comp_temp = raw_temp - ((cpu_temp - raw_temp) / TEMP_CORRECTION_FACTOR)
+        
+        
+        voc_index = process_gas_resistance(gas_ohms)
         
         is_occupied = pir.motion_detected
         safe_co2 = co2 if co2 else 400
         
-        c_score = calc_comfort_score(comp_temp, hum, safe_co2, voc)
+        c_score = calc_comfort_score(comp_temp, hum, safe_co2, voc_index)
 
         payload = {
             "recorded_at": loop_ts.strftime("%Y-%m-%d %H:%M:%SZ"),
             "pir_occupied": is_occupied,
             "temp_c": round(comp_temp, 2),
             "rh_percent": round(hum, 2) if hum else 0,
-            "voc_index": round(voc, 2),
+            "voc_index": round(voc_index, 0), 
             "co2_ppm": co2 if co2 else 0,
             "comfort_score": c_score,
         }
 
-        # --- GÜNCELLENMİŞ LOG FORMATI ---
         log_msg = (
             f"[{loop_ts.strftime('%H:%M:%S')}] "
-            f"CPU:{cpu_temp:.1f}°C | "      # YENİ
-            f"Ham:{raw_temp:.1f}°C | "      # YENİ
-            f"Net:{comp_temp:.1f}°C | "     # İşlenmiş
+            f"Net:{comp_temp:.1f}°C | "
             f"Nem:%{hum:.0f} | "
-            f"CO2:{co2 if co2 else '---'} | "
-            f"VOC:{voc:.0f} | "
-            f"Doluluk:{'VAR' if is_occupied else 'yok'} | "
+            f"VOC_Ohm:{gas_ohms:.0f} -> Index:{voc_index:.0f} | " 
             f"Skor:{c_score:.2f}" 
         )
         print(log_msg)
