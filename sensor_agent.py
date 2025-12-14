@@ -60,9 +60,9 @@ def main():
     print(">>> Sensörler nesneleri oluşturuluyor...")
     bme, scd4x, pir = setup_sensors()
     
-    # --- Tampon Bellekler (Buffer) ---
+    # Tampon Bellekler
     gas_readings = deque(maxlen=GAS_HISTORY_LEN)
-    temp_readings = deque(maxlen=TEMP_HISTORY_LEN) # <-- YENİ
+    temp_readings = deque(maxlen=TEMP_HISTORY_LEN)
 
     if not pir:
         print("Sensör hatası (I2C), çıkılıyor.")
@@ -112,40 +112,43 @@ def main():
             time.sleep(SENSOR_INTERVAL_SECONDS)
             continue
 
-        # --- 2. Veri İşleme (Smoothing) ---
+        # --- 2. Veri İşleme ---
         
-        # A. Gaz (VOC)
+        # Gaz (Smoothing)
         if instant_gas: gas_readings.append(instant_gas)
         avg_gas_ohms = sum(gas_readings) / len(gas_readings) if gas_readings else 50000.0
         voc_index = process_gas_resistance(avg_gas_ohms)
         
-        # B. Sıcaklık (CPU Düzeltmeli + Smoothing)
+        # Sıcaklık (CPU Düzeltme + Smoothing)
         cpu_temp = get_cpu_temperature()
         
-        # Anlık hesaplanan net sıcaklık
         current_comp_temp = raw_temp
         if cpu_temp > raw_temp:
             current_comp_temp = raw_temp - ((cpu_temp - raw_temp) / TEMP_CORRECTION_FACTOR)
             
-        # Listeye ekle ve ortalamasını al
         temp_readings.append(current_comp_temp)
-        avg_temp = sum(temp_readings) / len(temp_readings) # <-- ARTIK BUNU KULLANACAĞIZ
+        avg_temp = sum(temp_readings) / len(temp_readings) 
         
         is_occupied = pir.motion_detected
         safe_co2 = co2 if co2 else 400
         
-        # Konforu artık ORTALAMA sıcaklığa göre hesapla
+        # Konfor Skoru (Ortalama sıcaklık ile)
         c_score = calc_comfort_score(avg_temp, hum, safe_co2, voc_index)
 
-        # --- LOGLAMA ---
+        # --- EKSİKSİZ LOGLAMA ---
         status_tag = "ISINMA" if reading_counter < WARMUP_SKIP_COUNT else "KAYIT "
         
         log_msg = (
             f"[{loop_ts.strftime('%H:%M:%S')}] {status_tag} | "
-            f"CPU:{cpu_temp:.1f} | "
-            f"Net(Anlık):{current_comp_temp:.2f} | " # CPU gürültülü hali
-            f"Net(Avg):{avg_temp:.2f} | "            # Ütülenmiş hali
+            f"CPU:{cpu_temp:.1f}°C | "
+            f"HamT:{raw_temp:.1f}°C | "
+            f"Net(Anl):{current_comp_temp:.2f}°C | "
+            f"Net(Avg):{avg_temp:.2f}°C | " # Kararlı Sıcaklık
+            f"Nem:%{hum:.0f} | "             # <-- NEM BURADA
+            f"CO2:{co2 if co2 else '---'} | "# <-- CO2 BURADA
+            f"Ohm:{instant_gas:.0f} | "
             f"VOC:{voc_index:.0f} | "
+            f"PIR:{1 if is_occupied else 0} | " # <-- HAREKET BURADA
             f"Skor:{c_score:.2f}"
         )
         print(log_msg)
@@ -159,7 +162,7 @@ def main():
             "place_id": PLACE_ID,
             "recorded_at": loop_ts.strftime("%Y-%m-%d %H:%M:%SZ"),
             "pir_occupied": is_occupied,
-            "temp_c": round(avg_temp, 2), # Veritabanına stabil sıcaklık gidiyor
+            "temp_c": round(avg_temp, 2), # Veritabanına da kararlı sıcaklık gidiyor
             "rh_percent": round(hum, 2) if hum else 0,
             "voc_index": round(voc_index, 0),
             "co2_ppm": co2 if co2 else 0,
