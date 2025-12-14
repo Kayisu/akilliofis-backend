@@ -7,18 +7,15 @@ from gpiozero import MotionSensor
 from adafruit_bme680 import Adafruit_BME680_I2C
 from adafruit_scd4x import SCD4X
 
+# config dosyasından tüm ayarları çekiyoruz
 from config import (
     PB_ADMIN_EMAIL, PB_ADMIN_PASSWORD, PB_BASE_URL,
     SENSOR_INTERVAL_SECONDS, TEMP_CORRECTION_FACTOR, 
-    STARTUP_DELAY_SECONDS, PLACE_ID
+    STARTUP_DELAY_SECONDS, PLACE_ID,
+    WARMUP_SKIP_COUNT, GAS_HISTORY_LEN 
 )
 from comfort import calc_comfort_score
 from pb_client import PBClient
-
-# --- AYARLAR ---
-WARMUP_SKIP_COUNT = 12 
-# Son 10 veriyi hafızada tutup ortalamasını alacağız (Smoothing)
-GAS_HISTORY_LEN = 10 
 
 def setup_sensors():
     try:
@@ -56,9 +53,6 @@ def process_gas_resistance(gas_ohms):
     BME680 Ham Direnç -> VOC Index (0-500)
     """
     if gas_ohms is None: return 50.0
-    
-    # 50k Ohm = Çok Temiz (Index 25)
-    # 5k Ohm = Çok Kirli (Index 500)
     if gas_ohms >= 50000: return 25.0
     
     index = (-0.01 * gas_ohms) + 550
@@ -71,7 +65,7 @@ def main():
     print(">>> Sensörler nesneleri oluşturuluyor...")
     bme, scd4x, pir = setup_sensors()
     
-    # --- YENİ: Geçmiş verileri tutacak liste (Buffer) ---
+    # Config'den gelen uzunluk ile deque oluşturuluyor
     gas_readings = deque(maxlen=GAS_HISTORY_LEN)
 
     if not pir:
@@ -122,42 +116,49 @@ def main():
             time.sleep(SENSOR_INTERVAL_SECONDS)
             continue
 
-        # --- Isınma Kontrolü ---
-        if reading_counter < WARMUP_SKIP_COUNT:
-            # Isınma sırasında bile buffer'ı doldurmaya başlayalım
-            if instant_gas: gas_readings.append(instant_gas)
-            
-            print(f"[Isınma Modu] ({reading_counter + 1}/{WARMUP_SKIP_COUNT}) | Ohm: {instant_gas if instant_gas else '---'}")
-            reading_counter += 1
-            time.sleep(SENSOR_INTERVAL_SECONDS)
-            continue
-
-        # --- 2. Veri İşleme (Smoothing) ---
-        
-        # Anlık gaz değerini listeye ekle (Listenin sonuna ekler, başından atar)
+        # --- Veri İşleme ---
         if instant_gas:
             gas_readings.append(instant_gas)
         
-        # Ortalamayı al
-        if len(gas_readings) > 0:
-            avg_gas_ohms = sum(gas_readings) / len(gas_readings)
-        else:
-            avg_gas_ohms = 50000.0 # Varsayılan temiz
-            
+        avg_gas_ohms = sum(gas_readings) / len(gas_readings) if gas_readings else 50000.0
+        voc_index = process_gas_resistance(avg_gas_ohms)
+        
         cpu_temp = get_cpu_temperature()
         comp_temp = raw_temp
         if cpu_temp > raw_temp:
             comp_temp = raw_temp - ((cpu_temp - raw_temp) / TEMP_CORRECTION_FACTOR)
-        
-        # Hesaplamaya ARTIK ORTALAMA değer giriyor
-        voc_index = process_gas_resistance(avg_gas_ohms)
         
         is_occupied = pir.motion_detected
         safe_co2 = co2 if co2 else 400
         
         c_score = calc_comfort_score(comp_temp, hum, safe_co2, voc_index)
 
+        # --- LOGLAMA ---
+        status_tag = "ISINMA" if reading_counter < WARMUP_SKIP_COUNT else "KAYIT "
+        
+        log_msg = (
+            f"[{loop_ts.strftime('%H:%M:%S')}] {status_tag} | "
+            f"CPU:{cpu_temp:.1f}°C | "
+            f"HamT:{raw_temp:.1f}°C | "
+            f"NetT:{comp_temp:.1f}°C | "
+            f"Nem:%{hum:.0f} | "
+            f"CO2:{co2 if co2 else '---'} | "
+            f"Ohm:{instant_gas:.0f} (Avg:{avg_gas_ohms:.0f}) | "
+            f"VOC:{voc_index:.0f} | "
+            f"PIR:{1 if is_occupied else 0} | "
+            f"Skor:{c_score:.2f}"
+        )
+        print(log_msg)
+
+        # --- ISINMA BEKLEMESİ ---
+        if reading_counter < WARMUP_SKIP_COUNT:
+            reading_counter += 1
+            time.sleep(SENSOR_INTERVAL_SECONDS)
+            continue
+
+        # --- VERİTABANI KAYDI ---
         payload = {
+            "place_id": PLACE_ID,  # <-- DÜZELTİLDİ: Artık hangi ofise ait olduğunu biliyor
             "recorded_at": loop_ts.strftime("%Y-%m-%d %H:%M:%SZ"),
             "pir_occupied": is_occupied,
             "temp_c": round(comp_temp, 2),
@@ -166,16 +167,6 @@ def main():
             "co2_ppm": co2 if co2 else 0,
             "comfort_score": c_score,
         }
-
-        log_msg = (
-            f"[{loop_ts.strftime('%H:%M:%S')}] "
-            f"Net:{comp_temp:.1f}°C | "
-            f"Ohm(Anlık):{instant_gas:.0f} | "  # Logda anlık farkı gör
-            f"Ohm(Avg):{avg_gas_ohms:.0f} | "   # Logda yumuşatılmışı gör
-            f"Index:{voc_index:.0f} | "
-            f"Skor:{c_score:.2f}" 
-        )
-        print(log_msg)
 
         try:
             client.create_sensor_reading(payload)
