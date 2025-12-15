@@ -1,184 +1,206 @@
 import time
 import random
 import datetime
+import math
 from pocketbase import PocketBase
 
 # --- AYARLAR ---
+# Bu ayarlar proje yapisina uygun olarak sabit birakilmistir.
 PB_URL = "http://100.96.191.83:8090" 
 ADMIN_EMAIL = "pi_script@domain.com" 
 ADMIN_PASS = "12345678"               
 
 TARGET_PLACE_ID = "jat8nmi4h0bsii0"
 
-# Simülasyon Ayarları
+# Simulasyon parametreleri
 DAYS_BACK = 30            
 OFFICE_START_HOUR = 8     
 OFFICE_END_HOUR = 19      
 READING_INTERVAL_MIN = 10 
 
-# YUMUŞATMA FAKTÖRÜ (0.1 = Çok Yavaş, 0.5 = Hızlı, 1.0 = Anında)
-SMOOTHING = 0.15 
+# Fiziksel degisim katsayilari (Daha organik veriler icin)
+# Degerler 0.0 ile 1.0 arasindadir. Dusuk degerler daha yavas degisim (buyuk atalet) saglar.
+CO2_RISE_RATE = 0.08      # Insan varken CO2 artisi
+CO2_DECAY_RATE = 0.03     # Havalandirma ile azalma hizi
+TEMP_RISE_RATE = 0.05     # Sicaklik artisi (cok yavas)
+TEMP_DECAY_RATE = 0.04    # Soguma hizi
+VOC_CHANGE_RATE = 0.1     # Koku/Gaz degisimi
 
-def run_direct_upload():
+def get_weekly_occupancy_pattern(sim_time):
+    # Regresyon modelinin ogrenebilmesi icin tutarli bir desen olusturuyoruz.
+    # Pazartesi - Cuma arasi (0-4), Hafta sonu (5-6)
+    weekday = sim_time.weekday()
+    hour = sim_time.hour
+
+    base_attendees = 0
+
+    if weekday < 5: # Hafta ici
+        # Sabah toplantisi simulasyonu (09:00 - 11:00)
+        if 9 <= hour < 11:
+            base_attendees = 6
+        # Ogle yemegi sonrasi yogunluk (13:00 - 15:00)
+        elif 13 <= hour < 15:
+            base_attendees = 4
+        # Mesai bitimi oncesi hafiflik (16:00 - 17:00)
+        elif 16 <= hour < 17:
+            base_attendees = 2
+        
+        # Hafif rastgelelik ekle (her gun tipatip ayni olmasin ama benzer olsun)
+        if base_attendees > 0:
+            variation = random.randint(-1, 2)
+            base_attendees = max(0, base_attendees + variation)
+    
+    return base_attendees
+
+def calculate_comfort_score(temp, co2):
+    # Basit bir konfor skoru hesaplamasi
+    # Sicaklik puani (21-24 arasi ideal)
+    if 21.0 <= temp <= 24.0:
+        t_score = 1.0
+    else:
+        diff = min(abs(temp - 21.0), abs(temp - 24.0))
+        t_score = max(0.0, 1.0 - (diff * 0.25))
+
+    # Hava kalitesi puani
+    if co2 <= 800:
+        air_score = 1.0
+    else:
+        air_score = max(0.0, 1.0 - ((co2 - 800) / 1200.0))
+
+    # Agirlikli ortalama
+    final_score = (0.6 * t_score) + (0.4 * air_score)
+    return round(max(0.0, min(1.0, final_score)), 2)
+
+def run_organic_simulation():
     client = PocketBase(PB_URL)
-    print(f"{PB_URL} adresine bağlanılıyor...")
+    print(f"Sunucuya baglaniliyor: {PB_URL}")
     
     try:
         client.admins.auth_with_password(ADMIN_EMAIL, ADMIN_PASS)
-        print("Giriş başarılı.")
+        print("Yonetici girisi basarili.")
 
-        try:
-            target_place = client.collection("places").get_one(TARGET_PLACE_ID)
-            print(f"Hedef Oda: {target_place.name}")
-        except:
-            print("HATA: Oda bulunamadı!")
-            return
-
-        users = client.collection("users").get_full_list()
-        
+        # Onceki verileri temizleme istege bagli, surada sadece yeni veri ekliyoruz.
         start_date = datetime.datetime.now() - datetime.timedelta(days=DAYS_BACK)
         end_date = datetime.datetime.now()
         
-        total_reservations = 0
-        total_readings = 0
-
-        print(f"ORGANİK Veri üretimi başlıyor...")
-
         current_sim_time = start_date
-        active_reservation = None 
-        reservation_end_time = None
-        attendees_in_room = 0
+        
+        # Baslangic atmosfer degerleri (Sabah saatleri gibi serin ve temiz)
+        curr_co2 = 410.0
+        curr_temp = 21.0
+        curr_rh = 48.0
+        curr_voc = 20.0
+        
+        total_readings = 0
+        total_reservations = 0
 
-        # --- BAŞLANGIÇ DEĞERLERİ (State) ---
-        # Bu değerler döngü boyunca korunacak ve yavaş yavaş değişecek
-        curr_co2 = 400.0
-        curr_temp = 22.0
-        curr_voc = 50.0
-        curr_rh = 45.0
+        print("Organik veri uretimi basliyor...")
 
         while current_sim_time < end_date:
-            if OFFICE_START_HOUR <= current_sim_time.hour < OFFICE_END_HOUR:
+            # Ofis saatleri disinda hizli atla (geceleri veri az olsun veya olmasin)
+            if not (OFFICE_START_HOUR <= current_sim_time.hour < OFFICE_END_HOUR):
+                # Gece boyunca odayi sifirla (decay)
+                curr_co2 = max(400, curr_co2 - 10)
+                curr_temp = max(20.0, curr_temp - 0.1)
+                curr_voc = max(10, curr_voc - 2)
                 
-                # --- A. REZERVASYON ---
-                if active_reservation and current_sim_time >= reservation_end_time:
-                    active_reservation = None
-                    attendees_in_room = 0
+                current_sim_time += datetime.timedelta(minutes=READING_INTERVAL_MIN)
+                continue
 
-                if not active_reservation and random.random() < 0.20:
-                    duration = random.choice([1, 1.5, 2])
-                    res_end = current_sim_time + datetime.timedelta(hours=duration)
-                    if res_end.hour >= OFFICE_END_HOUR:
-                        res_end = current_sim_time.replace(hour=OFFICE_END_HOUR, minute=0)
+            # 1. O anki insan sayisini desenden cek
+            attendees = get_weekly_occupancy_pattern(current_sim_time)
+            
+            # Arada sirada rastgele bosluklar veya pikler (Noise)
+            if random.random() < 0.05: 
+                attendees = 0 if random.random() < 0.5 else attendees + 2
 
-                    cap = target_place.capacity if hasattr(target_place, 'capacity') else 5
-                    attendees_in_room = random.randint(1, cap)
-                    
+            is_occupied = attendees > 0
+
+            # 2. Rezervasyon Kaydi (Eger doluysa ve o saat basinda ise kayit at)
+            # Bu kisim sadece veritabaninda rezervasyon gorunmesi icin.
+            if is_occupied and current_sim_time.minute == 0 and random.random() < 0.3:
+                res_end = current_sim_time + datetime.timedelta(hours=1)
+                try:
                     res_data = {
-                        "place_id": target_place.id,
-                        "user_id": random.choice(users).id,
+                        "place_id": TARGET_PLACE_ID,
+                        "user_id": client.collection("users").get_list(1, 1).items[0].id, # Ilk kullaniciyi al
                         "start_ts": current_sim_time.isoformat(),
                         "end_ts": res_end.isoformat(),
                         "status": "completed",
                         "is_hidden": True,
-                        "attendee_count": attendees_in_room
+                        "attendee_count": attendees
                     }
-                    try:
-                        client.collection("reservations").create(res_data)
-                        total_reservations += 1
-                        active_reservation = True
-                        reservation_end_time = res_end
-                        print(f"[+] Rezervasyon: {attendees_in_room} Kişi", end="\r")
-                    except: pass
-
-                # --- B. SENSÖR (ORGANİK MANTIK) ---
-                
-                # 1. HEDEFLERİ BELİRLE (Target)
-                if active_reservation:
-                    # Dolu oda hedefleri
-                    target_co2 = 400 + (attendees_in_room * 250) # Kişi başı daha yüksek hedef ama yavaş çıkacak
-                    target_temp = 22.0 + (attendees_in_room * 0.6) 
-                    target_voc = 50 + (attendees_in_room * 40)
-                    target_rh = 45.0 + (attendees_in_room * 2)
-                    pir = random.random() < 0.95
-                else:
-                    # Boş oda hedefleri (Fabrika ayarları)
-                    target_co2 = 400.0
-                    target_temp = 22.0 # Klima set değeri
-                    target_voc = 50.0
-                    target_rh = 45.0
-                    pir = False
-
-                # 2. YAVAŞ GEÇİŞ (Smoothing)
-                # Formül: Yeni = Eski + (Fark * Hız) + Gürültü
-                
-                # CO2
-                diff_co2 = target_co2 - curr_co2
-                curr_co2 += (diff_co2 * SMOOTHING) + random.uniform(-10, 10)
-                
-                # Sıcaklık (Daha yavaş değişir)
-                diff_temp = target_temp - curr_temp
-                curr_temp += (diff_temp * (SMOOTHING / 2)) + random.uniform(-0.05, 0.05)
-                
-                # VOC
-                diff_voc = target_voc - curr_voc
-                curr_voc += (diff_voc * SMOOTHING) + random.uniform(-5, 5)
-
-                # Nem
-                diff_rh = target_rh - curr_rh
-                curr_rh += (diff_rh * SMOOTHING) + random.uniform(-1, 1)
-
-                # Sınırlandırma (Clamp)
-                curr_co2 = max(400, min(2500, curr_co2))
-                curr_temp = max(18, min(30, curr_temp))
-                curr_voc = max(0, min(500, curr_voc))
-
-                # --- KONFOR SKORU ---
-                # 1. Sıcaklık Skoru
-                if 21.0 <= curr_temp <= 24.0:
-                    t_score = 1.0
-                else:
-                    diff = min(abs(curr_temp - 21.0), abs(curr_temp - 24.0))
-                    t_score = max(0.0, 1.0 - (diff * 0.2))
-
-                # 2. Hava Kalitesi Skoru
-                if curr_co2 <= 800:
-                    air_score = 1.0
-                else:
-                    air_score = max(0.0, 1.0 - ((curr_co2 - 800) / 1000.0))
-
-                final_score_raw = (0.6 * t_score) + (0.4 * air_score)
-                final_score = round(max(0.0, min(1.0, final_score_raw)), 2)
-
-                reading_data = {
-                    "place_id": target_place.id,
-                    "recorded_at": current_sim_time.isoformat().replace("T", " "),
-                    "pir_occupied": pir,
-                    "temp_c": round(curr_temp, 2),
-                    "rh_percent": round(curr_rh, 2),
-                    "voc_index": int(curr_voc),
-                    "co2_ppm": int(curr_co2),
-                    "comfort_score": final_score
-                }
-
-                try:
-                    client.collection("sensor_readings").create(reading_data)
-                    total_readings += 1
+                    client.collection("reservations").create(res_data)
+                    total_reservations += 1
                 except: pass
 
+            # 3. Fizik Motoru (Degerleri guncelle)
+            
+            # CO2 Hesaplama
+            # Hedef: Kisi basi +400ppm katkida bulunur (basit yaklasim)
+            # Ancak direkt hedefe gitmek yerine, uretime gore artar.
+            if is_occupied:
+                # Uretim (Kisi sayisi * nefes faktoru)
+                production = attendees * 20.0 
+                # Mevcut degerden hedefe dogru yumusak artis
+                curr_co2 += production * CO2_RISE_RATE
             else:
-                # Gece boyunca değerleri sıfırla/soğut (Hızlı düşüş)
-                # Böylece sabah geldiğinde 400ppm'den başlar
-                curr_co2 = 400.0
-                curr_temp = 21.5
-                curr_voc = 50.0
+                # Havalandirma etkisi (400'e dogru azal)
+                diff = curr_co2 - 400.0
+                curr_co2 -= diff * CO2_DECAY_RATE
+
+            # Sicaklik Hesaplama
+            # Hedef: Insan vucut isisi odayi isitir (Max 26-27), Klima (22) sogutur
+            target_temp = 22.0 + (attendees * 0.5) if is_occupied else 21.5
+            temp_diff = target_temp - curr_temp
+            
+            if temp_diff > 0:
+                curr_temp += temp_diff * TEMP_RISE_RATE # Isinma
+            else:
+                curr_temp += temp_diff * TEMP_DECAY_RATE # Soguma
+
+            # Nem ve VOC (Hafif rastgele dalgalanma + insan etkisi)
+            target_rh = 45.0 + (attendees * 1.5)
+            curr_rh += (target_rh - curr_rh) * 0.1 + random.uniform(-0.5, 0.5)
+
+            target_voc = 50 + (attendees * 30)
+            curr_voc += (target_voc - curr_voc) * VOC_CHANGE_RATE + random.uniform(-2, 2)
+
+            # Sınırlandırma (Sacma degerleri engelle)
+            curr_co2 = max(400, min(3000, curr_co2))
+            curr_temp = max(18.0, min(35.0, curr_temp))
+            curr_voc = max(0, min(500, curr_voc))
+
+            # 4. Kayit Olustur
+            score = calculate_comfort_score(curr_temp, curr_co2)
+            
+            reading_data = {
+                "place_id": TARGET_PLACE_ID,
+                "recorded_at": current_sim_time.isoformat().replace("T", " "),
+                "pir_occupied": is_occupied,
+                "temp_c": round(curr_temp, 2),
+                "rh_percent": round(curr_rh, 2),
+                "voc_index": int(curr_voc),
+                "co2_ppm": int(curr_co2),
+                "comfort_score": score
+            }
+
+            try:
+                client.collection("sensor_readings").create(reading_data)
+                total_readings += 1
+                if total_readings % 50 == 0:
+                    print(f"Ilerliyor... Tarih: {current_sim_time.date()} - CO2: {int(curr_co2)} ppm")
+            except Exception as e:
+                print(f"Kayit hatasi: {e}")
 
             current_sim_time += datetime.timedelta(minutes=READING_INTERVAL_MIN)
 
-        print("\nTAMAMLANDI!")
-        print(f"Toplam {total_readings} adet 'yumuşak geçişli' veri yüklendi.")
+        print(f"\nISLEM TAMAMLANDI.")
+        print(f"Toplam Sensor Verisi: {total_readings}")
+        print(f"Toplam Rezervasyon: {total_reservations}")
 
     except Exception as e:
-        print(f"\nKritik Hata: {e}")
+        print(f"Kritik hata olustu: {e}")
 
 if __name__ == "__main__":
-    run_direct_upload()
+    run_organic_simulation()
