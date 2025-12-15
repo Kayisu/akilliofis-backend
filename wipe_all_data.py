@@ -54,6 +54,25 @@ def wipe_all():
         else:
             print("Rezervasyon tablosu zaten boş.")
 
+        # --- 3. TAHMİNLERİ SİL (Hepsini) ---
+        print("\nTüm tahminler aranıyor...")
+        forecasts = client.collection("forecasts").get_full_list()
+        
+        if len(forecasts) > 0:
+            print(f"Toplam {len(forecasts)} tahmin bulundu.")
+            if input("HEPSİNİ SİLMEK için 'sil' yazın: ") == "sil":
+                print("Siliniyor...", end="")
+                for item in forecasts:
+                    try:
+                        client.collection("forecasts").delete(item.id)
+                        print(".", end="", flush=True)
+                    except: pass
+                print("\nTahmin tablosu tertemiz oldu.")
+            else:
+                print("İptal edildi.")
+        else:
+            print("Tahmin tablosu zaten boş.")
+
     except Exception as e:
         print(f"\nHata: {e}")
 
