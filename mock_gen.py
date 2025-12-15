@@ -29,31 +29,33 @@ def get_target_occupancy(sim_time):
     weekday = sim_time.weekday() # 0=Pzt, 6=Paz
     hour = sim_time.hour
     
-    # Hafta sonu boş (veya çok az kişi)
-    if weekday >= 5:
-        return 0 if random.random() > 0.05 else 1 # %5 ihtimalle haftasonu 1 kişi
-
-    # Günlük yoğunluk katsayısı (Cuma daha boş, Salı/Çarşamba yoğun)
-    day_factor = {0: 0.8, 1: 1.0, 2: 1.0, 3: 0.9, 4: 0.6}.get(weekday, 0)
+    # [GÜNCELLEME] Hafta sonu ayrımı kaldırıldı. Her gün mesai var.
+    # Günlük yoğunluk katsayısı (Hepsi yüksek)
+    day_factor = 1.0 
 
     # Saatlik baz doluluk (Çan eğrisi benzeri)
     if 8 <= hour < 18:
         # Sabah artışı (8-10)
         if hour < 10: 
-            base = 2 + (hour - 8) * 2 # 2 -> 4
+            base = 2 + (hour - 8) * 1 # 2 -> 3 (Daha yavaş artış)
         # Öğle arası düşüşü (12-13)
         elif hour == 12:
             base = 2
         # Öğleden sonra yoğunluğu (13-16)
         elif 13 <= hour < 16:
-            base = 5
+            base = 4 # [GÜNCELLEME] Max 5 yerine 4 (Böylece %100'e yapışmaz)
         # Akşam çıkışı (16-18)
         else:
             base = 3 - (hour - 16) # 3 -> 2
             
-        # Rastgele dalgalanma
-        noise = random.randint(-1, 2)
+        # Rastgele dalgalanma (Gürültüyü azalttık)
+        noise = random.randint(-1, 1) 
         occupancy = max(0, int((base + noise) * day_factor))
+        
+        # [GÜNCELLEME] Kapasite kontrolü (Varsayılan 5 kabul edip, 4'ü geçirmemeye çalışalım)
+        # Amaç: %100 doluluğu nadir hale getirmek.
+        if occupancy > 4: occupancy = 4
+        
         return occupancy
     
     return 0 # Mesai dışı
