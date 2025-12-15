@@ -87,37 +87,80 @@ class SensorAgent:
 
     def read_sensors(self):
         if MOCK_MODE:
+            # --- GÜNCELLENMİŞ MOCK SİMÜLASYONU ---
+            # Saate göre değişen "canlı" veriler
+            now = datetime.datetime.now()
+            hour = now.hour
+            
+            # Baz Değerler (Gece/Boş)
+            base_temp = 20.0
+            base_co2 = 400
+            base_voc = 20
+            
+            # Mesai Saati Etkisi (08:00 - 19:00)
+            if 8 <= hour < 19:
+                # Sabah ısınma, öğleden sonra zirve
+                if hour < 12:
+                    occupancy_factor = (hour - 7) / 5.0 # Artış
+                else:
+                    occupancy_factor = 1.0 - ((hour - 12) / 10.0) # Hafif düşüş
+                
+                # Rastgelelik ekle
+                occupancy_factor += random.uniform(-0.1, 0.1)
+                occupancy_factor = max(0.1, occupancy_factor)
+
+                # Değerleri yükselt (İnsan varlığı etkisi)
+                base_temp += 3.0 * occupancy_factor  # 23-24 dereceye çıkar
+                base_co2 += 800 * occupancy_factor   # 1000-1200 ppm'e çıkar
+                base_voc += 100 * occupancy_factor   # 100-150'ye çıkar
+            
             return {
-                "temp": 22.0 + random.uniform(-0.5, 0.5),
-                "rh": 45.0 + random.uniform(-1, 1),
-                "voc": 50 + random.randint(-5, 5),
-                "co2": 450 + random.randint(-10, 10),
-                "pir": random.choice([True, False])
+                "temp": base_temp + random.uniform(-0.3, 0.3),
+                "rh": 45.0 + random.uniform(-2, 2),
+                "voc": base_voc + random.randint(-10, 10),
+                "co2": int(base_co2 + random.randint(-30, 30)),
+                "pir": (8 <= hour < 19) and (random.random() > 0.3) # Mesai saatinde %70 hareket var
             }
         
         # --- GERCEK OKUMA ---
-        pir = GPIO.input(self.pir_pin)
+        try:
+            pir = GPIO.input(self.pir_pin)
+        except:
+            pir = False
         
-        # Varsayilanlar
-        temp, rh, voc, co2 = 22.0, 45.0, 50.0, 400
+        # Varsayilanlar (Hata durumunda anlaşılsın diye -1 yapıyoruz veya logluyoruz)
+        temp, rh, voc, co2 = None, None, None, None
         
-        # BME680 Okuma ve Sicaklik Duzeltme
+        # BME680 Okuma
         if self.bme.get_sensor_data():
             raw_temp = self.bme.data.temperature
             rh = self.bme.data.humidity
             voc = self.bme.data.gas_resistance
             
             # --- SICAKLIK DUZELTME FORMULU ---
-            # Sensorun isinmasini CPU isisina gore kompanse ediyoruz
             cpu_temp = self.get_cpu_temperature()
             if cpu_temp > raw_temp:
                 temp = raw_temp - ((cpu_temp - raw_temp) / TEMP_CORRECTION_FACTOR)
             else:
                 temp = raw_temp
-        
+        else:
+            print("[UYARI] BME680 sensör verisi okunamadı/hazır değil.")
+
         # SCD41 Okuma
         if self.scd4x.data_ready:
             co2 = self.scd4x.CO2
+        else:
+            print("[UYARI] SCD4x sensör verisi hazır değil.")
+
+        # Eğer okuma yapılamadıysa varsayılanları kullan ama log bas
+        if temp is None: 
+            temp = 22.0
+            print("[HATA] Sıcaklık okunamadı, varsayılan 22.0 kullanılıyor.")
+        if rh is None: rh = 45.0
+        if voc is None: voc = 50.0
+        if co2 is None: 
+            co2 = 400
+            print("[HATA] CO2 okunamadı, varsayılan 400 kullanılıyor.")
             
         return {"temp": temp, "rh": rh, "voc": voc, "co2": co2, "pir": bool(pir)}
 
@@ -135,6 +178,9 @@ class SensorAgent:
                 vals['temp'], vals['rh'], vals['co2'], vals['voc']
             )
             
+            print(f"\n[DETAY] Temp: {vals['temp']:.2f} | RH: {vals['rh']:.2f} | CO2: {vals['co2']} | VOC: {vals['voc']}")
+            print(f"[DETAY] Hesaplanan Konfor Skoru: {score}")
+
             headers = {"Authorization": f"Bearer {self.token}"}
             payload = {
                 "place_id": PLACE_ID,
