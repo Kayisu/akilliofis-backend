@@ -9,7 +9,7 @@ import board
 # --- CONFIG ---
 from config import (
     PB_BASE_URL, PB_ADMIN_EMAIL, PB_ADMIN_PASSWORD, PLACE_ID, 
-    SENSOR_INTERVAL_SECONDS, TEMP_CORRECTION_FACTOR
+    SENSOR_INTERVAL_SECONDS, TEMP_CORRECTION_FACTOR, WARMUP_SKIP_COUNT
 )
 
 # --- MODULLER ---
@@ -163,12 +163,21 @@ class SensorAgent:
 
     def loop(self):
         print(f">> Loop started. PIR: GPIO 17.")
+        warmup_counter = 0
         
         while True:
             start_t = time.time()
             
             # A. SENSOR OPERATIONS
             vals = self.read_sensors()
+            
+            # WARMUP CHECK
+            if warmup_counter < WARMUP_SKIP_COUNT:
+                warmup_counter += 1
+                print(f"[WARMUP] Sensor stabilizing... ({warmup_counter}/{WARMUP_SKIP_COUNT})")
+                print(f"         Temp: {vals['temp']:.1f} | CO2: {vals['co2']}")
+                time.sleep(SENSOR_INTERVAL_SECONDS)
+                continue
             
             # Comfort Score
             score = calc_comfort_score(

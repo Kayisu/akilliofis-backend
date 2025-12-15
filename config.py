@@ -13,7 +13,7 @@ SENSOR_INTERVAL_SECONDS = 5
 STARTUP_DELAY_SECONDS = 30 
 
 # Sıcaklık Kalibrasyonu
-TEMP_CORRECTION_FACTOR = 0.85
+TEMP_CORRECTION_FACTOR = 2.5
 
 # --- Isınma ve Filtreleme Ayarları ---
 WARMUP_SKIP_COUNT = 30 # İlk 2.5 dakika kayıt yapma
