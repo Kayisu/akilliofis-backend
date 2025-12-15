@@ -6,7 +6,7 @@ def calculate_thermal_score(temp_c: float, rh: float) -> float:
     """
     if temp_c is None or rh is None: return 0.0
 
-    # --- 1. Sıcaklık Puanı (Parçalı Fonksiyon - Senin Kodun) ---
+    # --- 1. Sıcaklık Puanı (Parçalı Fonksiyon) ---
     if 21.0 <= temp_c <= 24.0:
         t_score = 1.0  # Altın Bölge
     elif 20.0 <= temp_c < 21.0:
@@ -21,7 +21,7 @@ def calculate_thermal_score(temp_c: float, rh: float) -> float:
         else:
             t_score = 0.7 - ((temp_c - 26.0) * 0.175)
 
-    # --- 2. Nem Cezası (ASHRAE - Senin Kodun) ---
+    # --- 2. Nem Cezası (ASHRAE) ---
     rh_penalty = 0.0
     if rh < 30:
         rh_penalty = (30 - rh) * 0.005 
@@ -35,7 +35,7 @@ def calculate_iaq_score(co2: float, voc_index: float) -> float:
     """
     WELL Building Standard & UBA Bazlı.
     """
-    # --- 1. CO2 Puanı (WELL Standardı - Senin Kodun) ---
+    # --- 1. CO2 Puanı (WELL Standardı) ---
     if co2 is None: co2_score = 0.0
     elif co2 <= 800:
         co2_score = 1.0
@@ -46,7 +46,7 @@ def calculate_iaq_score(co2: float, voc_index: float) -> float:
     else: # > 1500
         co2_score = max(0.0, 0.50 - ((co2 - 1500) * 0.0005))
 
-    # --- 2. VOC Puanı (UBA Sınıfları - Senin Kodun) ---
+    # --- 2. VOC Puanı (UBA Sınıfları) ---
     if voc_index is None: voc_score = 0.5
     elif voc_index <= 50:
         voc_score = 1.0
@@ -69,11 +69,10 @@ def calc_comfort_score(temp_c, rh, co2, voc_index) -> float:
     # Temel ağırlıklı ortalama
     base_score = (0.6 * t_score) + (0.4 * air_score)
 
-    # --- VETO / EMNİYET KİLİDİ (BURASI YENİ) ---
+    # --- VETO / EMNİYET KİLİDİ ---
     # Eğer değerler kritik sınırları aşarsa, ortalamaya bakmaksızın puanı kırarız.
     
     # 1. CO2 Limiti: 1200 ppm üstü 'Havasız' kabul edilir.
-    # Sıcaklık mükemmel olsa bile burası 0.45 (Kötü) puanı geçemez.
     if co2 is not None and co2 > 1200:
         base_score = min(base_score, 0.45)
 

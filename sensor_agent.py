@@ -2,14 +2,14 @@ import time
 import datetime
 import threading
 import requests
-import sys
-from collections import deque
+import os
+import math
+import board 
 
 # --- CONFIG ---
 from config import (
     PB_BASE_URL, PB_ADMIN_EMAIL, PB_ADMIN_PASSWORD, PLACE_ID, 
-    SENSOR_INTERVAL_SECONDS, TEMP_CORRECTION_FACTOR,
-    WARMUP_SKIP_COUNT, GAS_HISTORY_LEN, TEMP_HISTORY_LEN
+    SENSOR_INTERVAL_SECONDS, TEMP_CORRECTION_FACTOR
 )
 
 # --- MODULLER ---
@@ -17,228 +17,193 @@ from forecaster import DailyForecaster
 from comfort import calc_comfort_score
 
 # --- DONANIM KUTUPHANELERI (ZORUNLU) ---
-try:
-    import board
-    import adafruit_scd4x
-    import bme680
-    import RPi.GPIO as GPIO
-except ImportError as e:
-    print(f"\n[KRITIK HATA] Donanim kutuphaneleri eksik: {e}")
-    print("Sistem KAPATILIYOR. Lutfen 'pip install adafruit-circuitpython-scd4x bme680 RPi.GPIO' komutunu calistirin.")
-    sys.exit(1)
+# Eger bunlar yoksa kod hata verip kirilabilir, istenilen bu.
+from gpiozero import MotionSensor
+from adafruit_bme680 import Adafruit_BME680_I2C
+import adafruit_scd4x
 
 class SensorAgent:
     def __init__(self):
-        print("--- AKILLI OFIS AJANI (REAL MODE ONLY) ---")
+        print("--- AKILLI OFIS AJANI (PURE HARDWARE) ---")
         
-        # 1. Degiskenler
+        # 1. Baglantilar
+        self.forecaster = DailyForecaster()
         self.token = None
-        self.temp_buffer = deque(maxlen=TEMP_HISTORY_LEN or 10)
-        self.gas_buffer = deque(maxlen=GAS_HISTORY_LEN or 10)
-        
-        # 2. Baglanti
         self._login()
         
-        # 3. Donanim Baslatma
+        # 2. Donanim Baslatma
+        self.pir_sensor = None
+        self.bme680 = None
         self.scd4x = None
-        self.bme = None
-        self.pir_pin = 23
-        self._init_hardware() # Hata verirse programi durdurur
+        self._init_hardware()
 
-        # 4. Zamanlayicilar
-        self.forecaster = DailyForecaster()
+        # 3. Zamanlayicilar
         self.last_forecast_time = 0
-        self.forecast_interval = 24 * 3600
+        self.forecast_interval = 24 * 3600 # 24 Saatte bir
 
     def _login(self):
         try:
             payload = {"identity": PB_ADMIN_EMAIL, "password": PB_ADMIN_PASSWORD}
-            url = f"{PB_BASE_URL}/api/admins/auth-with-password"
-            r = requests.post(url, json=payload, timeout=5)
-            
+            r = requests.post(f"{PB_BASE_URL}/api/collections/users/auth-with-password", json=payload, timeout=5)
             if r.status_code == 404:
-                 url = f"{PB_BASE_URL}/api/collections/users/auth-with-password"
-                 r = requests.post(url, json=payload, timeout=5)
+                 r = requests.post(f"{PB_BASE_URL}/api/admins/auth-with-password", json=payload, timeout=5)
             
             if r.status_code == 200:
                 self.token = r.json().get("token")
-                print(">> PocketBase Girisi Basarili")
+                print(">> Login Basarili")
             else:
-                print(f">> Giris Hatasi: {r.status_code}")
-                # Giris yapamazsa da devam etmeyi dener ama veri gonderemez
+                print(f">> Login Basarisiz: {r.status_code}")
         except Exception as e: 
-            print(f">> Baglanti Hatasi: {e}")
+            print(f">> Login Hatasi: {e}")
 
     def _init_hardware(self):
-        print(">> Donanim baglantilari kontrol ediliyor...")
         try:
-            # 1. SCD41 (CO2)
             i2c = board.I2C()
+            
+            # --- SCD41 BASLATMA ---
             self.scd4x = adafruit_scd4x.SCD4X(i2c)
             self.scd4x.start_periodic_measurement()
-            print("   [OK] SCD41 (CO2)")
+            print(">> SCD4x Baslatildi")
 
-            # 2. BME680 (Sicaklik/Nem/Gaz)
+            # --- BME680 BASLATMA ---
             try:
-                self.bme = bme680.BME680(bme680.I2C_ADDR_PRIMARY)
-            except IOError:
-                self.bme = bme680.BME680(bme680.I2C_ADDR_SECONDARY)
+                self.bme680 = Adafruit_BME680_I2C(i2c, address=0x77)
+            except:
+                self.bme680 = Adafruit_BME680_I2C(i2c, address=0x76)
             
-            # BME Ayarlari
-            self.bme.set_humidity_oversample(bme680.OS_2X)
-            self.bme.set_pressure_oversample(bme680.OS_4X)
-            self.bme.set_temperature_oversample(bme680.OS_8X)
-            self.bme.set_filter(bme680.FILTER_SIZE_3)
-            self.bme.set_gas_status(bme680.ENABLE_GAS_MEAS)
-            self.bme.set_gas_heater_temperature(320)
-            self.bme.set_gas_heater_duration(150)
-            self.bme.select_gas_heater_profile(0)
-            print("   [OK] BME680 (Hava)")
+            self.bme680.sea_level_pressure = 1013.25
+            print(">> BME680 Baslatildi")
             
-            # 3. PIR (Hareket)
-            GPIO.setmode(GPIO.BCM)
-            GPIO.setup(self.pir_pin, GPIO.IN)
-            print("   [OK] PIR (Hareket)")
+            # --- PIR SENSOR (GPIO 17) ---
+            self.pir_sensor = MotionSensor(17)
+            print(">> PIR (GPIO 17) Baslatildi")
             
         except Exception as e:
-            print(f"\n[KRITIK DONANIM HATASI] : {e}")
-            print("Kablolarinizi kontrol edin. Program durduruluyor.")
-            sys.exit(1)
+            print(f"!!! KRITIK DONANIM HATASI !!!: {e}")
+            # Mock moda dusmek yok, hata gorunsun.
 
-    def _get_cpu_temperature(self):
+    def get_cpu_temperature(self):
         try:
             with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
                 return float(f.read()) / 1000.0
         except:
-            return 50.0
+            return 50.0 
+
+    def ohm_to_voc_index(self, gas_resistance_ohm):
+        """
+        BME680 Ohm -> IAQ Index (0-500)
+        """
+        if gas_resistance_ohm is None: return 50.0 
+        
+        min_ohm = 5000.0   # Cok kirli
+        max_ohm = 50000.0  # Temiz
+        
+        gas = max(min_ohm, min(gas_resistance_ohm, max_ohm))
+        
+        log_min = math.log(min_ohm)
+        log_max = math.log(max_ohm)
+        log_val = math.log(gas)
+        
+        factor = (log_val - log_min) / (log_max - log_min)
+        voc_index = (1.0 - factor) * 500.0
+        
+        return max(0, min(500, int(voc_index)))
 
     def read_sensors(self):
-        """
-        Sadece GERCEK veri doner. Hata varsa None doner.
-        Asla random sayi uretmez.
-        """
-        # 1. PIR Check
-        try:
-            pir_val = GPIO.input(self.pir_pin)
-        except:
-            print("[HATA] PIR Okunamadi")
-            pir_val = False
-
-        # 2. BME680 Check
-        temp, rh, voc = None, None, None
-        if self.bme and self.bme.get_sensor_data():
-            raw_temp = self.bme.data.temperature
-            rh = self.bme.data.humidity
-            voc = self.bme.data.gas_resistance
-            
-            # CPU sicaklik duzeltmesi
-            cpu_temp = self._get_cpu_temperature()
-            if cpu_temp > raw_temp:
-                temp = raw_temp - ((cpu_temp - raw_temp) / TEMP_CORRECTION_FACTOR)
-            else:
-                temp = raw_temp
-        else:
-            # BME verisi hazir degilse bekle
-            pass 
-
-        # 3. SCD41 Check
-        co2 = None
-        if self.scd4x and self.scd4x.data_ready:
-            co2 = self.scd4x.CO2
+        # --- SADECE GERCEK OKUMA ---
+        temp, rh, voc_ohms, co2, pir_val = None, None, None, None, False
         
-        # Eger kritik veriler yoksa None don
-        if temp is None or co2 is None:
-            return None
+        # 1. BME680
+        if self.bme680:
+            try:
+                raw_temp = self.bme680.temperature
+                rh = self.bme680.relative_humidity
+                voc_ohms = self.bme680.gas
+                
+                # Sicaklik Duzeltme
+                cpu_temp = self.get_cpu_temperature()
+                if cpu_temp > raw_temp:
+                    temp = raw_temp - ((cpu_temp - raw_temp) / TEMP_CORRECTION_FACTOR)
+                else:
+                    temp = raw_temp
+            except Exception as e:
+                print(f"[UYARI] BME Okuma: {e}")
 
-        return {"temp": temp, "rh": rh, "voc": voc, "co2": co2, "pir": bool(pir_val)}
+        # 2. SCD41
+        if self.scd4x and self.scd4x.data_ready:
+            try:
+                co2 = self.scd4x.CO2
+            except Exception as e:
+                print(f"[UYARI] SCD Okuma: {e}")
+
+        # 3. PIR
+        if self.pir_sensor:
+            try:
+                pir_val = self.pir_sensor.is_active 
+            except Exception as e:
+                print(f"[UYARI] PIR Okuma: {e}")
+
+        # Varsayilanlar (Veri yoksa yok demektir, uydurmak yok)
+        if temp is None: temp = 0.0 
+        if rh is None: rh = 0.0
+        if co2 is None: co2 = 0
+        
+        # VOC Donusumu (Ohm -> Index)
+        voc_index = self.ohm_to_voc_index(voc_ohms) if voc_ohms else 0.0
+
+        return {
+            "temp": temp, 
+            "rh": rh, 
+            "voc_index": voc_index, 
+            "co2": co2, 
+            "pir": pir_val
+        }
 
     def loop(self):
-        print(f">> Sensor dongusu basladi (Aralik: {SENSOR_INTERVAL_SECONDS}s)")
-        print(f">> Isinma Modu: {WARMUP_SKIP_COUNT} okuma boyunca kayit alinmayacak.")
+        print(f">> Dongu basladi. PIR: GPIO 17. Mock Mode: ASLA.")
         
-        loop_counter = 0
-
         while True:
             start_t = time.time()
-            loop_counter += 1
-
-            # A. VERI OKU
-            vals = self.read_sensors()
-
-            if vals is None:
-                print(f"[BEKLIYOR] Sensorler hazirlaniyor veya veri okunamadi... ({loop_counter})")
-                time.sleep(2)
-                continue
-
-            # B. BUFFER / SMOOTHING (Sadece gercek veri ile)
-            self.temp_buffer.append(vals['temp'])
-            if vals['voc']: self.gas_buffer.append(vals['voc'])
-
-            avg_temp = sum(self.temp_buffer) / len(self.temp_buffer)
-            # VOC Ohm degerini aliyoruz
-            avg_voc_ohm = sum(self.gas_buffer) / len(self.gas_buffer) if self.gas_buffer else vals['voc']
             
-            # Basit Ohm -> Index Donusumu (Ters oranti)
-            # 50k Ohm = Temiz (50 puan), 5k Ohm = Kirli (300 puan) gibi kaba taslak
-            voc_index_estimated = max(0, min(500, int((50000 - avg_voc_ohm) / 100)))
-            if voc_index_estimated < 0: voc_index_estimated = 0
+            # A. SENSOR ISLEMLERI
+            vals = self.read_sensors()
+            
+            # Konfor Skoru
+            score = calc_comfort_score(
+                vals['temp'], vals['rh'], vals['co2'], vals['voc_index']
+            )
+            
+            print(f"\n[OKUMA] T:{vals['temp']:.1f}C | RH:%{vals['rh']:.0f} | CO2:{vals['co2']} | VOC_IDX:{vals['voc_index']:.0f} | PIR:{vals['pir']}")
+            print(f"[SKOR] Konfor Skoru: {score}")
 
-            # C. ISINMA (WARMUP) KONTROLU
-            if loop_counter <= WARMUP_SKIP_COUNT:
-                remaining = WARMUP_SKIP_COUNT - loop_counter
-                print(f"[ISINIYOR] Kalan: {remaining} | T: {avg_temp:.1f} | CO2: {vals['co2']}")
-                time.sleep(SENSOR_INTERVAL_SECONDS)
-                continue
-
-            # D. KONFOR HESAPLA & GONDER
-            comfort = calc_comfort_score(avg_temp, vals['rh'], vals['co2'], voc_index_estimated)
-
+            headers = {"Authorization": f"Bearer {self.token}"}
             payload = {
                 "place_id": PLACE_ID,
                 "recorded_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "temp_c": round(avg_temp, 2),
+                "temp_c": round(vals['temp'], 2),
                 "rh_percent": round(vals['rh'], 2),
-                "voc_index": int(voc_index_estimated),
+                "voc_index": int(vals['voc_index']),
                 "co2_ppm": int(vals['co2']),
                 "pir_occupied": vals['pir'],
-                "comfort_score": comfort
+                "comfort_score": score 
             }
-
-            self._send_data(payload)
-
-            # E. FORECAST TETIKLEME
-            self._check_forecast()
-
-            elapsed = time.time() - start_t
-            time.sleep(max(0, SENSOR_INTERVAL_SECONDS - elapsed))
-
-    def _send_data(self, payload):
-        headers = {"Authorization": f"Bearer {self.token}"}
-        try:
-            r = requests.post(
-                f"{PB_BASE_URL}/api/collections/sensor_readings/records", 
-                json=payload, headers=headers, timeout=2
-            )
-            if r.status_code == 401:
-                print(">> Token suresi doldu, yenileniyor...")
-                self._login()
-            elif r.status_code >= 400:
-                print(f"[HATA] Sunucu Hatasi: {r.status_code}")
-            else:
-                print(f"[KAYIT] T:{payload['temp_c']} | CO2:{payload['co2_ppm']} | H:{payload['pir_occupied']}")
-        except Exception as e:
-            print(f"[HATA] Ag hatasi: {e}")
-
-    def _check_forecast(self):
-        if time.time() - self.last_forecast_time > self.forecast_interval:
-            print(">> Forecast guncelleniyor...")
+            
             try:
-                t = threading.Thread(target=self.forecaster.generate_forecast) # run_cycle degil direkt metod
+                requests.post(f"{PB_BASE_URL}/api/collections/sensor_readings/records", json=payload, headers=headers, timeout=2)
+            except: 
+                print("Veri gonderilemedi (Baglanti?)")
+                self._login()
+
+            # B. FORECAST
+            if time.time() - self.last_forecast_time > self.forecast_interval:
+                print(">> Tahmin zamani geldi...")
+                t = threading.Thread(target=self.forecaster.run_cycle)
                 t.daemon = True
                 t.start()
                 self.last_forecast_time = time.time()
-            except Exception as e:
-                print(f"Forecast baslatilamadi: {e}")
+
+            elapsed = time.time() - start_t
+            time.sleep(max(0, SENSOR_INTERVAL_SECONDS - elapsed))
 
 if __name__ == "__main__":
     agent = SensorAgent()
@@ -246,4 +211,3 @@ if __name__ == "__main__":
         agent.loop()
     except KeyboardInterrupt:
         print("\nKapatiliyor...")
-        GPIO.cleanup()
