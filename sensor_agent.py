@@ -172,10 +172,24 @@ class SensorAgent:
             vals = self.read_sensors()
             
             # WARMUP CHECK
-            if warmup_counter < WARMUP_SKIP_COUNT:
+            is_warmup = warmup_counter < WARMUP_SKIP_COUNT
+            if is_warmup:
                 warmup_counter += 1
-                print(f"[WARMUP] Sensor stabilizing... ({warmup_counter}/{WARMUP_SKIP_COUNT})")
-                print(f"         Temp: {vals['temp']:.1f} | CO2: {vals['co2']}")
+                status_label = f"WARMUP ({warmup_counter}/{WARMUP_SKIP_COUNT})"
+            else:
+                status_label = "ACTIVE"
+
+            # Loglama (Tek seferde, temiz format)
+            print(f"\n--- SENSOR READING [{status_label}] ---")
+            print(f"CPU Temp      : {vals['cpu_temp']:.1f} C")
+            print(f"Raw Sensor    : {vals['raw_temp']:.1f} C")
+            print(f"Processed Temp: {vals['temp']:.1f} C")
+            print(f"Humidity      : {vals['rh']:.1f} %")
+            print(f"VOC Index     : {vals['voc_index']:.0f}")
+            print(f"PIR           : {vals['pir']}")
+            print(f"-------------------------------------")
+
+            if is_warmup:
                 time.sleep(SENSOR_INTERVAL_SECONDS)
                 continue
             
@@ -184,16 +198,8 @@ class SensorAgent:
                 vals['temp'], vals['rh'], vals['co2'], vals['voc_index']
             )
             
-            print(f"\n--- SENSOR READING ---")
-            print(f"CPU Temp      : {vals['cpu_temp']:.1f} C")
-            print(f"Raw Sensor    : {vals['raw_temp']:.1f} C")
-            print(f"Ambient Temp  : {vals['temp']:.1f} C (Corrected)")
-            print(f"Humidity      : {vals['rh']:.1f} %")
-            print(f"CO2           : {vals['co2']} ppm")
-            print(f"VOC Index     : {vals['voc_index']:.0f}/500")
-            print(f"PIR Detection : {'DETECTED' if vals['pir'] else 'NONE'}")
             print(f"Comfort Score : {score}")
-            print(f"----------------------")
+            print(f"CO2           : {vals['co2']} ppm") # CO2 verisi de önemli, ekliyoruz.
 
             headers = {"Authorization": f"Bearer {self.token}"}
             payload = {
