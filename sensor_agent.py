@@ -1,3 +1,4 @@
+#sensor_agent.py
 import time
 import datetime
 import threading
@@ -5,45 +6,35 @@ import requests
 import os
 import math
 import board 
-
-# --- CONFIG ---
 from config import (
     PB_BASE_URL, PB_ADMIN_EMAIL, PB_ADMIN_PASSWORD, PLACE_ID, 
     SENSOR_INTERVAL_SECONDS, TEMP_CORRECTION_FACTOR, WARMUP_SKIP_COUNT
 )
-
-# --- MODULLER ---
 from forecaster import WeeklyForecaster 
 from comfort import calc_comfort_score
-
-# --- DONANIM KUTUPHANELERI (ZORUNLU) ---
-# Eger bunlar yoksa kod hata verip kirilabilir, istenilen bu.
 from gpiozero import MotionSensor
 from adafruit_bme680 import Adafruit_BME680_I2C
 import adafruit_scd4x
 
 class SensorAgent:
     def __init__(self):
-        print("--- SMART OFFICE AGENT STARTED ---")
+        print("--- AKILLI OFİS ARACISI BAŞLATILDI ---")
         
-        # 1. Connections
         self.forecaster = WeeklyForecaster()
         self.token = None
         self._login()
         
-        # Run initial forecast immediately
-        print(">> Triggering initial weekly forecast...")
+        print(">> İlk haftalık tahmin tetikleniyor...")
         t = threading.Thread(target=self.forecaster.run_cycle)
         t.daemon = True
         t.start()
         
-        # 2. Hardware Initialization
         self.pir_sensor = None
         self.bme680 = None
         self.scd4x = None
         self._init_hardware()
 
-        # 3. Timers
+        # 3. Zamanlayıcılar
         self.last_forecast_time = time.time()
         self.forecast_interval = 24 * 3600
 
@@ -56,36 +47,36 @@ class SensorAgent:
             
             if r.status_code == 200:
                 self.token = r.json().get("token")
-                print(">> Login Successful")
+                print(">> Giriş başarılı")
             else:
-                print(f">> Login Failed: {r.status_code}")
+                print(f">> Giriş başarısız: {r.status_code}")
         except Exception as e: 
-            print(f">> Login Error: {e}")
+            print(f">> Giriş hatası: {e}")
 
     def _init_hardware(self):
         try:
             i2c = board.I2C()
             
-            # --- SCD41 ---
+            # --- SCD41 (CO2 sensörü) ---
             self.scd4x = adafruit_scd4x.SCD4X(i2c)
             self.scd4x.start_periodic_measurement()
-            print(">> SCD4x Initialized")
+            print(">> SCD4x sensörü başlatıldı")
 
-            # --- BME680 ---
+            # --- BME680 (sıcaklık/nem/VOC sensörü) ---
             try:
                 self.bme680 = Adafruit_BME680_I2C(i2c, address=0x77)
             except:
                 self.bme680 = Adafruit_BME680_I2C(i2c, address=0x76)
             
             self.bme680.sea_level_pressure = 1013.25
-            print(">> BME680 Initialized")
+            print(">> BME680 sensörü başlatıldı")
             
-            # --- PIR SENSOR (GPIO 17) ---
+            # --- PIR HAREKET SENSÖRÜ (GPIO 17) ---
             self.pir_sensor = MotionSensor(17)
-            print(">> PIR (GPIO 17) Initialized")
+            print(">> PIR (GPIO 17) hareket sensörü başlatıldı")
             
         except Exception as e:
-            print(f"!!! CRITICAL HARDWARE ERROR !!!: {e}")
+            print(f"!!! KRİTİK DONANIM HATASI !!!: {e}")
 
     def get_cpu_temperature(self):
         try:
@@ -96,7 +87,7 @@ class SensorAgent:
 
     def ohm_to_voc_index(self, gas_resistance_ohm):
         """
-        BME680 Ohm -> IAQ Index (0-500)
+        BME680 Ohm -> IAQ (Hava Kalitesi) İndeksi (0-500)
         """
         if gas_resistance_ohm is None: return 50.0 
         
@@ -119,36 +110,36 @@ class SensorAgent:
         raw_temp = 0.0
         cpu_temp = self.get_cpu_temperature()
         
-        # 1. BME680
+        # BME680 sensör okuması
         if self.bme680:
             try:
                 raw_temp = self.bme680.temperature
                 rh = self.bme680.relative_humidity
                 voc_ohms = self.bme680.gas
                 
-                # Temperature Correction
+                # Sıcaklık düşürme düzeltmesi (CPU ısısı etkisini azaltma)
                 if cpu_temp > raw_temp:
                     temp = raw_temp - ((cpu_temp - raw_temp) / TEMP_CORRECTION_FACTOR)
                 else:
                     temp = raw_temp
             except Exception as e:
-                print(f"[WARNING] BME Read: {e}")
+                print(f"[UYARI] BME680 okuma hatası: {e}")
 
-        # 2. SCD41
+        # SCD41 CO2 sensör okuması
         if self.scd4x and self.scd4x.data_ready:
             try:
                 co2 = self.scd4x.CO2
             except Exception as e:
-                print(f"[WARNING] SCD Read: {e}")
+                print(f"[UYARI] SCD4x okuma hatası: {e}")
 
-        # 3. PIR
+        # PIR hareket sensörü okuması
         if self.pir_sensor:
             try:
                 pir_val = self.pir_sensor.is_active 
             except Exception as e:
-                print(f"[WARNING] PIR Read: {e}")
+                print(f"[UYARI] PIR okuma hatası: {e}")
 
-        # VOC Conversion (Ohm -> Index)
+        # VOC dönüşümü (Ohm -> İndeks)
         voc_index = self.ohm_to_voc_index(voc_ohms) if voc_ohms else 0.0
 
         return {
@@ -162,24 +153,23 @@ class SensorAgent:
         }
 
     def loop(self):
-        print(f">> Loop started. PIR: GPIO 17.")
+        print(f">> Döngü başlatıldı. PIR: GPIO 17.")
         warmup_counter = 0
         
         while True:
             start_t = time.time()
             
-            # A. SENSOR OPERATIONS
+            # Sensör işlemleri
             vals = self.read_sensors()
             
-            # WARMUP CHECK
+            # Isınma süresi kontrolü
             is_warmup = warmup_counter < WARMUP_SKIP_COUNT
             if is_warmup:
                 warmup_counter += 1
                 status_label = f"WARMUP ({warmup_counter}/{WARMUP_SKIP_COUNT})"
             else:
                 status_label = "ACTIVE"
-
-            # Loglama (Tek seferde, temiz format)
+                
             print(f"\n--- SENSOR READING [{status_label}] ---")
             print(f"CPU Temp      : {vals['cpu_temp']:.1f} C")
             print(f"Raw Sensor    : {vals['raw_temp']:.1f} C")
@@ -187,19 +177,19 @@ class SensorAgent:
             print(f"Humidity      : {vals['rh']:.1f} %")
             print(f"VOC Index     : {vals['voc_index']:.0f}")
             print(f"PIR           : {vals['pir']}")
+            print(f"CO2           : {vals['co2']} ppm")
             print(f"-------------------------------------")
 
             if is_warmup:
                 time.sleep(SENSOR_INTERVAL_SECONDS)
                 continue
             
-            # Comfort Score
+            # Konfor skoru hesaplama
             score = calc_comfort_score(
                 vals['temp'], vals['rh'], vals['co2'], vals['voc_index']
             )
             
-            print(f"Comfort Score : {score}")
-            print(f"CO2           : {vals['co2']} ppm") # CO2 verisi de önemli, ekliyoruz.
+            print(f"Konfor Skoru  : {score}")
 
             headers = {"Authorization": f"Bearer {self.token}"}
             payload = {
@@ -216,12 +206,12 @@ class SensorAgent:
             try:
                 requests.post(f"{PB_BASE_URL}/api/collections/sensor_readings/records", json=payload, headers=headers, timeout=2)
             except: 
-                print("Data send failed (Connection?)")
+                print("Veri gönderimi başarısız (Bağlantı sorunu olabilir mi?)")
                 self._login()
 
-            # B. FORECAST
+            #Tahmin başlatma
             if time.time() - self.last_forecast_time > self.forecast_interval:
-                print(">> Forecasting time...")
+                print(">> Tahmin zamanı...")
                 t = threading.Thread(target=self.forecaster.run_cycle)
                 t.daemon = True
                 t.start()
@@ -235,4 +225,4 @@ if __name__ == "__main__":
     try:
         agent.loop()
     except KeyboardInterrupt:
-        print("\nKapatiliyor...")
+        print("\nKapatılıyor...")

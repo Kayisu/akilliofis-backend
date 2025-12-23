@@ -1,3 +1,4 @@
+# forecaster.py
 import datetime
 import requests
 import pandas as pd
@@ -59,7 +60,6 @@ class WeeklyForecaster:
             print("   [Forecaster] Login failed.")
             return
 
-        # Use PLACE_ID from config
         target_places = []
         if PLACE_ID:
             try:

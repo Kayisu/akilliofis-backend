@@ -1,5 +1,4 @@
 # pb_client.py
-
 import requests
 import datetime
 from dataclasses import dataclass
@@ -85,7 +84,7 @@ class PBClient:
         
         params = {
             "sort": "-created",
-            "perPage": 500, # İhtiyaca göre artırılabilir
+            "perPage": 500, 
             "filter": f"place_id='{PLACE_ID}' && created >= '{start_str}'"
         }
         try:

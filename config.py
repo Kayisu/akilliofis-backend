@@ -1,3 +1,4 @@
+#config.py
 import os
 
 # PocketBase Ayarları
@@ -21,4 +22,4 @@ WARMUP_SKIP_COUNT = 30 # İlk 2.5 dakika kayıt yapma
 # Hareketli Ortalama Uzunlukları (Smoothing)
 # Son 10 verinin ortalamasını alarak ani zıplamaları önler.
 GAS_HISTORY_LEN = 10 
-TEMP_HISTORY_LEN = 10  # <-- YENİ: Sıcaklık için tampon bellek
+TEMP_HISTORY_LEN = 10 
